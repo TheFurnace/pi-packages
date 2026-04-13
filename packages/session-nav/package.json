@@ -1,0 +1,10 @@
+{
+  "name": "@pi-agent/session-nav",
+  "version": "0.1.0",
+  "description": "Hotkey navigation through the pi session tree — jump to previous/next user message",
+  "keywords": ["pi-package"],
+  "files": ["index.ts"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
