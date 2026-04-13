@@ -1,0 +1,10 @@
+{
+  "name": "@pi-agent/notify",
+  "version": "0.1.0",
+  "description": "Focus-aware desktop/terminal notification for pi — fires when the agent finishes and the terminal is not the active window",
+  "keywords": ["pi-package"],
+  "files": ["index.ts", "docs/"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
