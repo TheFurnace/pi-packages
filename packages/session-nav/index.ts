@@ -7,21 +7,8 @@
  *   /jump-tree    — Open the user-message navigator and jump in one step.
  *   /jump-to <id> — Jump to a specific session entry by ID (used by the shortcut).
  *
- * Shortcut: ctrl+x  (two steps)
- *   1. Opens a SelectList of all user messages across all branches.
- *      Current-branch entries are marked ●, other-branch entries ○.
- *      Selection starts at the most recent user message on the current branch.
- *   2. After confirming a selection the editor is pre-filled with
- *      "/jump-to <id>". Press Enter to execute the jump.
- *
- *   Why two steps: shortcut handlers receive ExtensionContext, which does not
- *   include navigateTree(). Commands receive ExtensionCommandContext and do.
- *   Interactive input (pressing Enter in the editor) goes through command
- *   interception, so the Enter press after the shortcut is what makes the
- *   navigation proper.
- *
- *   /jump-tree skips the two-step dance and navigates immediately because it
- *   runs entirely inside a command handler.
+ * Shortcuts: ctrl+, (back) / ctrl+. (forward)
+ *   Pre-fill the editor with "/jump-back" or "/jump-forward" respectively
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
@@ -219,26 +206,36 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// -------------------------------------------------------------------------
-	// ctrl+x shortcut — opens SelectList, then pre-fills /jump-to <id>
+	// ctrl+, / ctrl+. shortcuts — pre-fill the editor with /jump-back or /jump-forward
 	//
-	// Shortcuts receive ExtensionContext (no navigateTree). The workaround:
-	// after the user picks a message the editor is pre-filled with the
-	// /jump-to command. Pressing Enter submits it as interactive input, which
-	// goes through command interception and calls navigateTree() properly.
+	// Shortcuts receive a stripped-down ExtensionContext: navigateTree() is not
+	// present at runtime (casting to any throws). The only working path is to
+	// route through typed command input. Pre-filling the editor with /jump-back
+	// and pressing Enter triggers command interception with the full
+	// ExtensionCommandContext, where navigateTree() is available.
 	// -------------------------------------------------------------------------
 
-	pi.registerShortcut(Key.ctrl("x"), {
-		description: "Open user-message navigator (select, then press Enter to jump)",
+	pi.registerShortcut(Key.ctrl("."), {
+		description: "Jump forward to the next response (press Enter to confirm)",
 		handler: async (ctx) => {
 			if (!ctx.isIdle()) {
 				ctx.ui.notify("Cannot navigate while agent is running", "warning");
 				return;
 			}
-			const selectedId = await pickUserMessage(ctx);
-			if (!selectedId) return;
+			ctx.ui.setEditorText("/jump-forward");
+			ctx.ui.notify("Press Enter to jump to the next response", "info");
+		},
+	});
 
-			ctx.ui.setEditorText("/jump-to " + selectedId);
-			ctx.ui.notify("Press Enter to jump to the selected message", "info");
+	pi.registerShortcut(Key.ctrl(","), {
+		description: "Jump to the previous user message (press Enter to confirm)",
+		handler: async (ctx) => {
+			if (!ctx.isIdle()) {
+				ctx.ui.notify("Cannot navigate while agent is running", "warning");
+				return;
+			}
+			ctx.ui.setEditorText("/jump-back");
+			ctx.ui.notify("Press Enter to jump to the previous user message", "info");
 		},
 	});
 }
