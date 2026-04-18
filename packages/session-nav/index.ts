@@ -1,98 +1,38 @@
 /**
- * session-nav — Hotkey navigation through the session tree.
+ * session-nav — Session tree navigation helpers for pi.
  *
- * Registers two commands and two shortcuts:
+ * Commands:
+ *   /jump-back    — Navigate to the previous user message in the current branch.
+ *   /jump-forward — Walk forward to the end of the next turn (undo jump-back).
+ *   /jump-tree    — Open the user-message navigator and jump in one step.
+ *   /jump-to <id> — Jump to a specific session entry by ID (used by the shortcut).
  *
- *   /jump-back    (ctrl+alt+up)   — Navigate to the previous user message.
- *                                   Leaf moves to its parent; the message text
- *                                   is placed in the editor for re-editing.
+ * Shortcut: ctrl+x  (two steps)
+ *   1. Opens a SelectList of all user messages across all branches.
+ *      Current-branch entries are marked ●, other-branch entries ○.
+ *      Selection starts at the most recent user message on the current branch.
+ *   2. After confirming a selection the editor is pre-filled with
+ *      "/jump-to <id>". Press Enter to execute the jump.
  *
- *   /jump-forward (ctrl+alt+down) — Walk forward through the most-recently-
- *                                   timestamped child chain, crossing one
- *                                   user-message boundary, and land on the
- *                                   last non-user entry of that turn.
- *                                   This reverses a /jump-back without
- *                                   storing any extra state.
+ *   Why two steps: shortcut handlers receive ExtensionContext, which does not
+ *   include navigateTree(). Commands receive ExtensionCommandContext and do.
+ *   Interactive input (pressing Enter in the editor) goes through command
+ *   interception, so the Enter press after the shortcut is what makes the
+ *   navigation proper.
  *
- * Shortcuts use pi.sendUserMessage() to invoke the commands because
- * registerShortcut handlers receive ExtensionContext, which does not
- * include navigateTree(). Commands receive ExtensionCommandContext,
- * which does.
- *
- * Default keybindings can be overridden in ~/.pi/agent/keybindings.json.
- * The commands can also be invoked directly from the editor.
+ *   /jump-tree skips the two-step dance and navigates immediately because it
+ *   runs entirely inside a command handler.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { Key } from "@mariozechner/pi-tui";
+import { Key, SelectList } from "@mariozechner/pi-tui";
+import type { SelectItem } from "@mariozechner/pi-tui";
 
 export default function (pi: ExtensionAPI) {
 	// -------------------------------------------------------------------------
-	// Tree traversal helpers
+	// Shared helpers
 	// -------------------------------------------------------------------------
 
-	/**
-	 * Walk the current branch from leaf toward root (skipping the leaf itself)
-	 * and return the first user-message entry found, or null.
-	 */
-	function findPreviousUserEntry(ctx: ExtensionCommandContext) {
-		const branch = ctx.sessionManager.getBranch(); // [root, ..., leaf]
-		// branch[length-1] is always the current leaf — skip it and search backward.
-		for (let i = branch.length - 2; i >= 0; i--) {
-			const entry = branch[i];
-			if (entry.type === "message" && entry.message.role === "user") {
-				return entry;
-			}
-		}
-		return null;
-	}
-
-	/**
-	 * Walk forward from the current leaf through the most-recently-timestamped
-	 * child at each step.
-	 *
-	 * Strategy: pass through exactly one user-message boundary, then keep
-	 * collecting non-user entries until the branch tip or the next user
-	 * message. Return the ID of the last non-user entry encountered — that
-	 * is the natural "end of turn" landing point, mirroring where the leaf
-	 * would sit after a full assistant response.
-	 *
-	 * Returns null when already at the tip (no children ahead).
-	 */
-	function findForwardTargetId(ctx: ExtensionCommandContext): string | null {
-		const currentLeafId = ctx.sessionManager.getLeafId();
-		if (!currentLeafId) return null;
-
-		let nodeId = currentLeafId;
-		let lastNonUserId: string | null = null;
-		let passedUserMessage = false;
-
-		while (true) {
-			const children = ctx.sessionManager.getChildren(nodeId);
-			if (children.length === 0) break;
-
-			// Follow the most recently created child (= the most active branch).
-			const mostRecent = children.reduce((a, b) =>
-				new Date(a.timestamp).getTime() >= new Date(b.timestamp).getTime() ? a : b,
-			);
-
-			if (mostRecent.type === "message" && mostRecent.message.role === "user") {
-				// Hit a user-message boundary.
-				if (passedUserMessage) break; // Already crossed one — stop here.
-				passedUserMessage = true;
-				nodeId = mostRecent.id;
-				continue;
-			}
-
-			// Non-user entry: record as the current best landing point and go deeper.
-			lastNonUserId = mostRecent.id;
-			nodeId = mostRecent.id;
-		}
-
-		return lastNonUserId;
-	}
-
-	/** Extract plain text from a user message's content (string or block array). */
 	function extractText(content: string | Array<{ type: string; text?: string }>): string {
 		if (typeof content === "string") return content;
 		return content
@@ -101,86 +41,204 @@ export default function (pi: ExtensionAPI) {
 			.join("");
 	}
 
-	// -------------------------------------------------------------------------
-	// Command handlers
-	// -------------------------------------------------------------------------
-
-	async function doJumpBack(ctx: ExtensionCommandContext): Promise<void> {
-		await ctx.waitForIdle();
-
-		const target = findPreviousUserEntry(ctx);
-		if (!target) {
-			ctx.ui.notify("Already at the earliest user message", "info");
-			return;
+	/** Walk [root, ..., leaf], return the first user-message entry before the leaf. */
+	function findPreviousUserEntry(sm: any) {
+		const branch = sm.getBranch();
+		for (let i = branch.length - 2; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type === "message" && entry.message.role === "user") return entry;
 		}
-
-		// navigateTree on a user-message entry sets the leaf to its parent
-		// and returns { cancelled }. Editor text must be set manually.
-		const result = await ctx.navigateTree(target.id, { summarize: false });
-		if (result.cancelled) return;
-
-		const text = extractText(target.message.content as string | Array<{ type: string; text?: string }>);
-		if (text) ctx.ui.setEditorText(text);
-
-		ctx.ui.notify("↑ Jumped to previous user message", "info");
+		return null;
 	}
 
-	async function doJumpForward(ctx: ExtensionCommandContext): Promise<void> {
-		await ctx.waitForIdle();
+	/**
+	 * Walk forward from the current leaf through the most-recently-timestamped
+	 * child, crossing exactly one user-message boundary, and return the ID of
+	 * the last non-user entry in that turn.
+	 */
+	function findForwardTargetId(sm: any): string | null {
+		const currentLeafId = sm.getLeafId();
+		if (!currentLeafId) return null;
 
-		const targetId = findForwardTargetId(ctx);
-		if (!targetId) {
-			ctx.ui.notify("Already at the latest response", "info");
-			return;
+		let nodeId = currentLeafId;
+		let lastNonUserId: string | null = null;
+		let passedUserMessage = false;
+
+		while (true) {
+			const children = sm.getChildren(nodeId);
+			if (children.length === 0) break;
+			const mostRecent = children.reduce((a: any, b: any) =>
+				new Date(a.timestamp).getTime() >= new Date(b.timestamp).getTime() ? a : b,
+			);
+			if (mostRecent.type === "message" && mostRecent.message.role === "user") {
+				if (passedUserMessage) break;
+				passedUserMessage = true;
+				nodeId = mostRecent.id;
+				continue;
+			}
+			lastNonUserId = mostRecent.id;
+			nodeId = mostRecent.id;
+		}
+		return lastNonUserId;
+	}
+
+	/**
+	 * Build a SelectList of all user messages across all branches.
+	 * Returns the selected entry ID, or null if the user cancelled.
+	 */
+	async function pickUserMessage(ctx: any): Promise<string | null> {
+		const allEntries: any[] = ctx.sessionManager.getEntries();
+		const branchIds = new Set<string>(ctx.sessionManager.getBranch().map((e: any) => e.id));
+
+		const userMessages = allEntries.filter(
+			(e) => e.type === "message" && e.message.role === "user",
+		);
+
+		if (userMessages.length === 0) {
+			ctx.ui.notify("No user messages in session", "info");
+			return null;
 		}
 
-		// navigateTree on a non-user entry sets the leaf to that entry directly.
-		const result = await ctx.navigateTree(targetId, { summarize: false });
-		if (result.cancelled) return;
+		const items: SelectItem[] = userMessages.map((entry: any) => {
+			const raw = extractText(entry.message.content);
+			const label = raw.length > 60 ? raw.slice(0, 60) + "…" : raw;
+			return {
+				value: entry.id,
+				label: (branchIds.has(entry.id) ? "● " : "○ ") + label,
+			};
+		});
 
-		// Landing on a non-user entry — clear any leftover editor text.
-		ctx.ui.setEditorText("");
+		// Start at the most recent user message on the current branch.
+		let initialIndex = 0;
+		for (let i = userMessages.length - 1; i >= 0; i--) {
+			if (branchIds.has(userMessages[i].id)) { initialIndex = i; break; }
+		}
 
-		ctx.ui.notify("↓ Jumped forward to next response", "info");
+		return ctx.ui.custom<string | null>((tui: any, theme: any, _kb: any, done: any) => {
+			const list = new SelectList(items, Math.min(items.length, 14), {
+				selectedPrefix: (t) => theme.fg("accent", t),
+				selectedText:   (t) => theme.fg("accent", t),
+				description:    (t) => theme.fg("muted", t),
+				scrollInfo:     (t) => theme.fg("dim", t),
+				noMatch:        (t) => theme.fg("warning", t),
+			});
+			list.setSelectedIndex(initialIndex);
+			list.onSelect = (item) => done(item.value);
+			list.onCancel = () => done(null);
+			return {
+				render:      (w: number) => list.render(w),
+				invalidate:  () => list.invalidate(),
+				handleInput: (d: string) => { list.handleInput(d); tui.requestRender(); },
+			};
+		});
 	}
 
 	// -------------------------------------------------------------------------
-	// Commands (receive ExtensionCommandContext → can call navigateTree)
+	// /jump-back
 	// -------------------------------------------------------------------------
 
 	pi.registerCommand("jump-back", {
-		description: "Jump to the previous user message in the session tree (shortcut: ctrl+alt+up)",
-		handler: async (_args, ctx) => doJumpBack(ctx),
-	});
-
-	pi.registerCommand("jump-forward", {
-		description: "Jump forward to the next response in the session tree (shortcut: ctrl+alt+down)",
-		handler: async (_args, ctx) => doJumpForward(ctx),
-	});
-
-	// -------------------------------------------------------------------------
-	// Shortcuts (receive ExtensionContext only → trigger commands via message)
-	// -------------------------------------------------------------------------
-
-	pi.registerShortcut(Key.ctrlAlt("up"), {
-		description: "Jump to previous user message (see /jump-back)",
-		handler: (ctx) => {
-			if (!ctx.isIdle()) {
-				ctx.ui.notify("Cannot navigate while agent is running", "warning");
-				return;
-			}
-			pi.sendUserMessage("/jump-back");
+		description: "Jump to the previous user message in the session tree",
+		handler: async (_args, ctx) => {
+			await ctx.waitForIdle();
+			const target = findPreviousUserEntry(ctx.sessionManager);
+			if (!target) { ctx.ui.notify("Already at the earliest user message", "info"); return; }
+			const result = await ctx.navigateTree(target.id, { summarize: false });
+			if (result.cancelled) return;
+			const text = extractText(target.message.content as string | Array<{ type: string; text?: string }>);
+			if (text) ctx.ui.setEditorText(text);
+			ctx.ui.notify("↑ Jumped to previous user message", "info");
 		},
 	});
 
-	pi.registerShortcut(Key.ctrlAlt("down"), {
-		description: "Jump forward to next response (see /jump-forward)",
-		handler: (ctx) => {
+	// -------------------------------------------------------------------------
+	// /jump-forward
+	// -------------------------------------------------------------------------
+
+	pi.registerCommand("jump-forward", {
+		description: "Jump forward to the next response in the session tree",
+		handler: async (_args, ctx) => {
+			await ctx.waitForIdle();
+			const targetId = findForwardTargetId(ctx.sessionManager as any);
+			if (!targetId) { ctx.ui.notify("Already at the latest response", "info"); return; }
+			const result = await ctx.navigateTree(targetId, { summarize: false });
+			if (result.cancelled) return;
+			ctx.ui.setEditorText("");
+			ctx.ui.notify("↓ Jumped forward to next response", "info");
+		},
+	});
+
+	// -------------------------------------------------------------------------
+	// /jump-tree — full one-step navigator (command context → navigateTree)
+	// -------------------------------------------------------------------------
+
+	pi.registerCommand("jump-tree", {
+		description: "Open user-message navigator and jump immediately",
+		handler: async (_args, ctx) => {
+			await ctx.waitForIdle();
+			const selectedId = await pickUserMessage(ctx);
+			if (!selectedId) return;
+
+			const entry = ctx.sessionManager.getEntry(selectedId) as any;
+			const result = await ctx.navigateTree(selectedId, { summarize: false });
+			if (result.cancelled) return;
+
+			if (entry?.type === "message" && entry.message.role === "user") {
+				const text = extractText(entry.message.content);
+				if (text) ctx.ui.setEditorText(text);
+			}
+			ctx.ui.notify("Jumped to selected user message", "info");
+		},
+	});
+
+	// -------------------------------------------------------------------------
+	// /jump-to <id> — navigate to a specific entry ID (used by the shortcut)
+	// -------------------------------------------------------------------------
+
+	pi.registerCommand("jump-to", {
+		description: "Jump to a session entry by ID — used by the ctrl+x shortcut",
+		handler: async (args, ctx) => {
+			await ctx.waitForIdle();
+			const entryId = args.trim();
+			if (!entryId) { ctx.ui.notify("Usage: /jump-to <entry-id>", "warning"); return; }
+
+			const entry = ctx.sessionManager.getEntry(entryId) as any;
+			if (!entry) { ctx.ui.notify("Entry not found: " + entryId, "error"); return; }
+
+			const result = await ctx.navigateTree(entryId, { summarize: false });
+			if (result.cancelled) return;
+
+			if (entry.type === "message" && entry.message.role === "user") {
+				const text = extractText(entry.message.content);
+				if (text) ctx.ui.setEditorText(text);
+			} else {
+				ctx.ui.setEditorText("");
+			}
+			ctx.ui.notify("Jumped to selected entry", "info");
+		},
+	});
+
+	// -------------------------------------------------------------------------
+	// ctrl+x shortcut — opens SelectList, then pre-fills /jump-to <id>
+	//
+	// Shortcuts receive ExtensionContext (no navigateTree). The workaround:
+	// after the user picks a message the editor is pre-filled with the
+	// /jump-to command. Pressing Enter submits it as interactive input, which
+	// goes through command interception and calls navigateTree() properly.
+	// -------------------------------------------------------------------------
+
+	pi.registerShortcut(Key.ctrl("x"), {
+		description: "Open user-message navigator (select, then press Enter to jump)",
+		handler: async (ctx) => {
 			if (!ctx.isIdle()) {
 				ctx.ui.notify("Cannot navigate while agent is running", "warning");
 				return;
 			}
-			pi.sendUserMessage("/jump-forward");
+			const selectedId = await pickUserMessage(ctx);
+			if (!selectedId) return;
+
+			ctx.ui.setEditorText("/jump-to " + selectedId);
+			ctx.ui.notify("Press Enter to jump to the selected message", "info");
 		},
 	});
 }

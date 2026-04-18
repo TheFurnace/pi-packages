@@ -1,0 +1,15 @@
+{
+  "name": "@pi-agent/markdown-fix",
+  "version": "0.1.0",
+  "description": "Fixes pi TUI markdown rendering: fenced code blocks render flush to the left edge (no paddingX margin) and use full terminal width before wrapping. Also fixes syntax-highlighted code blocks showing plain text color instead of the mdCodeBlock theme color when the language has no matching tokens.",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "files": ["index.ts"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
