@@ -1,0 +1,10 @@
+{
+  "name": "@pi-agent/sys-line",
+  "version": "0.1.0",
+  "description": "Appends 'as <username>' to the pi footer via a status line",
+  "keywords": ["pi-package"],
+  "files": ["index.ts"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
