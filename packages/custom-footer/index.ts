@@ -4,7 +4,7 @@
  * Renders three sections:
  *
  *   ~/Repos/my-project (main) • My Session — alice as root
- *   ↑9 ↓5.6k R119k W31k ~5 req (sub) 3.5%/1.0M   (provider) claude-sonnet-4.6 • medium
+ *   ↑9 ↓5.6k R119k W31k ~5 preq (sub) 3.5%/1.0M   (provider) claude-sonnet-4.6 • medium
  *   ext-status-a  ext-status-b
  *
  * Line 1  — CWD (~ shortened), git branch, session name, user (sudoer as user / user)
@@ -212,7 +212,7 @@ export default function (pi: ExtensionAPI) {
 						// Round to 1 decimal; display as integer when whole (e.g. "5" not "5.0").
 						const rounded = Math.round(premiumRequests * 10) / 10;
 						const reqStr = rounded % 1 === 0 ? rounded.toString() : rounded.toFixed(1);
-						statsParts.push(`~${reqStr} req (sub)`);
+						statsParts.push(`~${reqStr} preq (sub)`);
 					} else if (totalCost) {
 						statsParts.push(`$${totalCost.toFixed(3)}`);
 					}
