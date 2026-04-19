@@ -10,6 +10,7 @@ description: Reads, writes, searches, and manages notes in a running Obsidian va
 > **Requirement:** Obsidian must be running. Requires Obsidian 1.12.7+ installer with **Settings → General → Command line interface** enabled.
 
 **Full command reference:** [commands.md](commands.md)  
+**Omnisearch (full-text search):** [omnisearch.md](omnisearch.md)  
 **Installation & troubleshooting:** [troubleshooting.md](troubleshooting.md)  
 **TUI keyboard shortcuts:** [tui-shortcuts.md](tui-shortcuts.md)
 
@@ -74,9 +75,8 @@ obsidian daily                              # open
 obsidian daily:read                         # read contents
 obsidian daily:append content=<text>        # append to today
 
-# Search
-obsidian search query=<text> [limit=<n>]
-obsidian search:context query=<text>        # grep-style with line context
+# Search (Omnisearch)
+bash scripts/omnisearch.sh "<query>" [--vault <name>] [--limit <n>] [--format excerpts|paths|json]
 
 # Tasks
 obsidian tasks [file=<name>] [todo] [done] [verbose]
@@ -91,7 +91,8 @@ obsidian property:remove name=<name> [file=<name>]
 obsidian tags [file=<name>] [counts]
 ```
 
-For links, outline, templates, vault, plugins, sync, history, bookmarks, publish, and dev commands, see [commands.md](commands.md).
+For links, outline, templates, vault, plugins, sync, history, bookmarks, publish, and dev commands, see [commands.md](commands.md).  
+For full Omnisearch usage, output formats, and direct invocation, see [omnisearch.md](omnisearch.md).
 
 ---
 
@@ -124,9 +125,9 @@ obsidian task ref="Journal/2026-04-19.md:5" toggle
 ### Search, review, and update
 ```shell
 # 1. Find notes matching a topic
-obsidian search query="project phoenix" limit=10
+bash scripts/omnisearch.sh "project phoenix" --limit 10
 
-# 2. Read a result
+# 2. Read a result (use path from omnisearch output)
 obsidian read file="Project Phoenix Kickoff"
 
 # 3. Mark it reviewed
