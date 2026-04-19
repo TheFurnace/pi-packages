@@ -1,0 +1,13 @@
+{
+  "name": "@pi-agent/anthropic-sandbox",
+  "version": "0.1.0",
+  "description": "OS-level sandboxing for pi via @anthropic-ai/sandbox-runtime — network and filesystem restrictions on macOS and Linux",
+  "keywords": ["pi-package"],
+  "files": ["index.ts", "docs/"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.26"
+  }
+}
