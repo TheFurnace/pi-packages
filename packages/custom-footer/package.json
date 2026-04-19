@@ -1,0 +1,10 @@
+{
+  "name": "@pi-agent/custom-footer",
+  "version": "0.1.0",
+  "description": "Replicates pi's built-in footer via ctx.ui.setFooter() — a reference implementation and starting point for custom footers",
+  "keywords": ["pi-package"],
+  "files": ["index.ts"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
