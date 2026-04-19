@@ -4,7 +4,7 @@
  * Renders three sections:
  *
  *   ~/Repos/my-project (main) • My Session — alice as root
- *   ↑9 ↓5.6k R119k W31k ~59 req (sub) 3.5%/1.0M   (provider) claude-sonnet-4-6 • medium
+ *   ↑9 ↓5.6k R119k W31k ~5 req (sub) 3.5%/1.0M   (provider) claude-sonnet-4.6 • medium
  *   ext-status-a  ext-status-b
  *
  * Line 1  — CWD (~ shortened), git branch, session name, user (sudoer as user / user)
@@ -42,6 +42,60 @@ function formatTokens(count: number): string {
 	if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
 	if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
 	return `${Math.round(count / 1_000_000)}M`;
+}
+
+// ─── GitHub Copilot premium request multipliers ─────────────────────────────
+
+/**
+ * Maps Copilot model IDs (lowercased) to their premium request multiplier.
+ * Models with multiplier 0 are "included" on paid plans (no premium cost).
+ * Source: https://docs.github.com/en/copilot/concepts/billing/copilot-requests
+ *
+ * Note: Only user-initiated prompts consume premium requests. Tool-calling
+ * steps that Copilot takes autonomously do NOT count per the billing docs.
+ */
+const COPILOT_MULTIPLIERS: Record<string, number> = {
+	// Claude (Anthropic)
+	"claude-haiku-4.5":     0.33,
+	"claude-sonnet-4":      1,
+	"claude-sonnet-4.5":    1,
+	"claude-sonnet-4.6":    1,
+	"claude-opus-4.5":      3,
+	"claude-opus-4.6":      3,
+	"claude-opus-4.6-fast": 30, // preview fast mode
+	"claude-opus-4.7":      7.5,
+	// Gemini (Google)
+	"gemini-2.5-pro":       1,
+	"gemini-3-flash":       0.33,
+	"gemini-3.1-pro":       1,
+	// GPT (OpenAI) — 0× on paid plans (included models)
+	"gpt-4.1":              0,
+	"gpt-4o":               0,
+	"gpt-5-mini":           0,
+	"gpt-5.2":              1,
+	"gpt-5.2-codex":        1,
+	"gpt-5.3-codex":        1,
+	"gpt-5.4":              1,
+	"gpt-5.4-mini":         0.33,
+	// Grok (xAI)
+	"grok-code-fast-1":     0.25,
+	// Raptor (GitHub) — included
+	"raptor-mini":          0,
+};
+
+/**
+ * Returns the Copilot premium request multiplier for a model ID.
+ * Falls back to 1× for unknown models (conservative: assume premium).
+ * Tries exact match first, then prefix match to handle dated variants
+ * like "claude-sonnet-4.6-20250514".
+ */
+function getCopilotMultiplier(modelId: string): number {
+	const key = modelId.toLowerCase();
+	if (key in COPILOT_MULTIPLIERS) return COPILOT_MULTIPLIERS[key]!;
+	for (const [k, v] of Object.entries(COPILOT_MULTIPLIERS)) {
+		if (key.startsWith(k)) return v;
+	}
+	return 1; // Unknown model — assume 1× premium
 }
 
 // ─── User label ──────────────────────────────────────────────────────────────
@@ -95,12 +149,13 @@ export default function (pi: ExtensionAPI) {
 					let totalCacheRead = 0;
 					let totalCacheWrite = 0;
 					let totalCost = 0;
-					// Count non-aborted assistant messages as a proxy for premium API
-					// requests. Each one = one call to the Anthropic API regardless of
-					// whether it was a tool-use step or a final stop. Aborted messages
-					// (input=0, output=0) are excluded — they were cancelled before any
-					// tokens arrived and almost certainly don't consume a premium request.
-					let apiRequestCount = 0;
+					// Premium request cost: sum model multipliers for each completed user
+					// prompt (stopReason=stop/length/error). Per GitHub Copilot billing docs:
+					//   - Only user-initiated prompts count as premium requests
+					//   - Autonomous tool-calling steps (stopReason=toolUse) do NOT count
+					//   - Aborted responses (input=0, output=0) were cancelled before billing
+					//   - Each completed prompt costs 1 × the model's multiplier
+					let premiumRequests = 0;
 
 					for (const entry of ctx.sessionManager.getEntries()) {
 						if (entry.type === "message" && entry.message.role === "assistant") {
@@ -110,7 +165,13 @@ export default function (pi: ExtensionAPI) {
 							totalCacheRead += m.usage.cacheRead;
 							totalCacheWrite += m.usage.cacheWrite;
 							totalCost += m.usage.cost.total;
-							if (m.stopReason !== "aborted") apiRequestCount++;
+							// stopReason=stop/length = end of a user-initiated prompt → premium
+							// stopReason=error = API processed the request → likely billed
+							// stopReason=toolUse = autonomous step → excluded per billing docs
+							// stopReason=aborted = cancelled before processing → not billed
+							if (m.stopReason === "stop" || m.stopReason === "length" || m.stopReason === "error") {
+								premiumRequests += getCopilotMultiplier(m.model);
+							}
 						}
 					}
 
@@ -143,14 +204,15 @@ export default function (pi: ExtensionAPI) {
 					if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
 					if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
 
-					// Show cost, or for subscription models show an API-request count
-					// as an approximation of premium requests consumed.
+					// Show cost, or for subscription models show premium request estimate.
 					const usingSubscription =
 						ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
 					if (usingSubscription) {
-						// Cost is always $0 for subscription — show request count instead.
-						// Each non-aborted assistant message = one call to the API.
-						statsParts.push(`~${apiRequestCount} req (sub)`);
+						// Cost is always $0 on subscription — show premium request estimate.
+						// Round to 1 decimal; display as integer when whole (e.g. "5" not "5.0").
+						const rounded = Math.round(premiumRequests * 10) / 10;
+						const reqStr = rounded % 1 === 0 ? rounded.toString() : rounded.toFixed(1);
+						statsParts.push(`~${reqStr} req (sub)`);
 					} else if (totalCost) {
 						statsParts.push(`$${totalCost.toFixed(3)}`);
 					}
