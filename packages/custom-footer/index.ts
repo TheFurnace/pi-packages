@@ -3,11 +3,11 @@
  *
  * Renders three sections:
  *
- *   ~/Repos/my-project (main) • My Session
+ *   ~/Repos/my-project (main) • My Session — alice as root
  *   ↑9 ↓5.6k R119k W31k $0.000 (sub) 3.5%/1.0M   (provider) claude-sonnet-4-6 • medium
  *   ext-status-a  ext-status-b
  *
- * Line 1  — CWD (~ shortened), git branch, session name
+ * Line 1  — CWD (~ shortened), git branch, session name, user (sudoer as user / user)
  * Line 2  — Token stats (input/output/cache/cost), context %, model + provider + thinking level
  * Line 3+ — Extension statuses (from ctx.ui.setStatus()), sorted alphabetically
  *
@@ -17,6 +17,7 @@
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { userInfo } from "node:os";
 
 // ─── Helpers (mirrors FooterComponent internals) ──────────────────────────────
 
@@ -43,9 +44,24 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1_000_000)}M`;
 }
 
+// ─── User label ──────────────────────────────────────────────────────────────
+
+/**
+ * Returns a user label of the form "sudoUser as currentUser" when running
+ * under sudo, or just "currentUser" otherwise.
+ */
+function buildUserLabel(): string {
+	const currentUser = userInfo().username;
+	const sudoUser = process.env.SUDO_USER;
+	return sudoUser ? `${sudoUser} as ${currentUser}` : currentUser;
+}
+
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// Computed once at load time — username doesn't change during a session.
+	const userLabel = buildUserLabel();
+
 	// Stored so the model_select event can trigger re-renders from outside the
 	// footer factory closure.
 	let requestRender: (() => void) | undefined;
@@ -110,6 +126,8 @@ export default function (pi: ExtensionAPI) {
 
 					const sessionName = ctx.sessionManager.getSessionName();
 					if (sessionName) pwd = `${pwd} • ${sessionName}`;
+
+					pwd = `${pwd} — ${userLabel}`;
 
 					// ── Line 2: token stats + context % ───────────────────────────
 					const statsParts: string[] = [];
