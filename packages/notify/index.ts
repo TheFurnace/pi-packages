@@ -99,6 +99,25 @@ function probeBackend(): Backend {
 
 // ─── Per-backend dispatch ─────────────────────────────────────────────────────
 
+/**
+ * Dismiss/close a previously sent notification, where the backend supports it.
+ *
+ * OSC 99 (Kitty): close the notification with matching id.
+ * OSC 777 / PowerShell: no standard close mechanism — no-op.
+ */
+function dismissNotification(backend: Backend): void {
+	switch (backend) {
+		case "osc99":
+			// Kitty close sequence: same notification id (i=1), payload close
+			process.stdout.write("\x1b]99;i=1:p=close;\x1b\\");
+			break;
+		case "osc777":
+		case "powershell":
+			// No standard close mechanism available for these backends.
+			break;
+	}
+}
+
 function windowsToastScript(title: string, body: string): string {
 	const type     = "Windows.UI.Notifications";
 	const mgr      = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
@@ -370,13 +389,23 @@ export default function (pi: ExtensionAPI) {
 	// ── Per-agent-run state ───────────────────────────────────────────────────
 	let runState: RunState = { startTime: 0, userPrompt: "", toolLog: [] };
 
+	// ── Notification dismissal state ──────────────────────────────────────────
+	/** True while a notification has been sent and not yet dismissed. */
+	let notificationPending = false;
+
 	// ── Focus helpers ─────────────────────────────────────────────────────────
 	function enableFocusTracking() {
 		if (trackingActive) return;
 		process.stdout.write(FOCUS_ENABLE);
 		stdinListener = (chunk: Buffer) => {
 			const str = chunk.toString("binary");
-			if (str.includes(SEQ_FOCUS_IN))  isFocused = true;
+			if (str.includes(SEQ_FOCUS_IN)) {
+				isFocused = true;
+				if (notificationPending) {
+					dismissNotification(backend);
+					notificationPending = false;
+				}
+			}
 			if (str.includes(SEQ_FOCUS_OUT)) isFocused = false;
 		};
 		process.stdin.on("data", stdinListener);
@@ -442,5 +471,6 @@ export default function (pi: ExtensionAPI) {
 		);
 
 		sendNotification(backend, title, body);
+		notificationPending = true;
 	});
 }
