@@ -1,0 +1,7 @@
+{
+  "name": "@pi-agent/obsidian",
+  "version": "0.1.0",
+  "description": "Pi skills for interacting with Obsidian vaults via the Obsidian CLI",
+  "keywords": ["pi-package"],
+  "files": ["skills/"]
+}
