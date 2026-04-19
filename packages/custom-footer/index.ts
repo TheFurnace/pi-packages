@@ -4,7 +4,7 @@
  * Renders three sections:
  *
  *   ~/Repos/my-project (main) • My Session — alice as root
- *   ↑9 ↓5.6k R119k W31k $0.000 (sub) 3.5%/1.0M   (provider) claude-sonnet-4-6 • medium
+ *   ↑9 ↓5.6k R119k W31k ~59 req (sub) 3.5%/1.0M   (provider) claude-sonnet-4-6 • medium
  *   ext-status-a  ext-status-b
  *
  * Line 1  — CWD (~ shortened), git branch, session name, user (sudoer as user / user)
@@ -95,6 +95,12 @@ export default function (pi: ExtensionAPI) {
 					let totalCacheRead = 0;
 					let totalCacheWrite = 0;
 					let totalCost = 0;
+					// Count non-aborted assistant messages as a proxy for premium API
+					// requests. Each one = one call to the Anthropic API regardless of
+					// whether it was a tool-use step or a final stop. Aborted messages
+					// (input=0, output=0) are excluded — they were cancelled before any
+					// tokens arrived and almost certainly don't consume a premium request.
+					let apiRequestCount = 0;
 
 					for (const entry of ctx.sessionManager.getEntries()) {
 						if (entry.type === "message" && entry.message.role === "assistant") {
@@ -104,6 +110,7 @@ export default function (pi: ExtensionAPI) {
 							totalCacheRead += m.usage.cacheRead;
 							totalCacheWrite += m.usage.cacheWrite;
 							totalCost += m.usage.cost.total;
+							if (m.stopReason !== "aborted") apiRequestCount++;
 						}
 					}
 
@@ -136,13 +143,16 @@ export default function (pi: ExtensionAPI) {
 					if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
 					if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
 
-					// Show cost; append "(sub)" when model is on an OAuth subscription.
+					// Show cost, or for subscription models show an API-request count
+					// as an approximation of premium requests consumed.
 					const usingSubscription =
 						ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false;
-					if (totalCost || usingSubscription) {
-						statsParts.push(
-							`$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`,
-						);
+					if (usingSubscription) {
+						// Cost is always $0 for subscription — show request count instead.
+						// Each non-aborted assistant message = one call to the API.
+						statsParts.push(`~${apiRequestCount} req (sub)`);
+					} else if (totalCost) {
+						statsParts.push(`$${totalCost.toFixed(3)}`);
 					}
 
 					// Context percentage – colour-coded by saturation.
