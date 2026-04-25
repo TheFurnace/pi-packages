@@ -10,7 +10,7 @@ const DEFAULT_KEY_LINK_LIMIT = 8;
 const { gfm } = TurndownPluginGfm as { gfm?: (service: TurndownService) => void };
 
 type ExtractedFrom = "main" | "article" | "body" | "document" | "navigation" | "links";
-type ReadMode = "page" | "navigation" | "links";
+type ReadMode = "page" | "navigation" | "links" | "raw";
 type LinkScope = "all" | "internal" | "external";
 type NavigationSectionTag = "nav" | "header" | "aside" | "footer";
 
@@ -67,10 +67,10 @@ function isProbablyHtml(contentType: string, body: string): boolean {
 
 function normalizeMode(input?: string): ReadMode {
   const mode = (input ?? "page").trim().toLowerCase();
-  if (mode === "page" || mode === "navigation" || mode === "links") {
+  if (mode === "page" || mode === "navigation" || mode === "links" || mode === "raw") {
     return mode;
   }
-  throw new Error('Invalid mode. Expected "page", "navigation", or "links".');
+  throw new Error('Invalid mode. Expected "page", "navigation", "links", or "raw".');
 }
 
 function normalizeLinkScope(input?: string): LinkScope {
@@ -524,12 +524,13 @@ export default function turndownWebExtension(pi: ExtensionAPI) {
       "Use read_website with its default page mode for most web-reading tasks.",
       "Use read_website with mode navigation when the user wants menus, site structure, navigational chrome, or grouped links rather than the main article body.",
       "Use read_website with mode links when the user wants only the page's links, optionally filtered to internal or external links.",
+      "Use read_website with mode raw as a fallback for Single Page Applications (SPAs) to inspect raw HTML, embedded JSON, or find API endpoints when standard page extraction fails.",
     ],
     parameters: Type.Object({
       url: Type.String({ description: "HTTP or HTTPS URL to fetch. If no scheme is provided, https:// is assumed." }),
       mode: Type.Optional(
         Type.String({
-          description: 'Read mode: "page" (default) for the most useful readable page content, "navigation" for nav/header/footer/aside content plus links, or "links" for just links.',
+          description: 'Read mode: "page" (default) for the most useful readable page content, "navigation" for nav/header/footer/aside content plus links, "links" for just links, or "raw" for raw HTML.',
         }),
       ),
       linkScope: Type.Optional(
@@ -600,7 +601,10 @@ export default function turndownWebExtension(pi: ExtensionAPI) {
           content: [{ type: "text", text: `Converting ${finalUrl} to Markdown with Turndown...` }],
         });
 
-        if (mode === "navigation") {
+        if (mode === "raw") {
+          extractedFrom = "document";
+          markdown = rawBody;
+        } else if (mode === "navigation") {
           extractedFrom = "navigation";
           const navigation = buildNavigationMarkdown(rawBody, finalUrl, { linkScope, sameSiteOnly });
           markdown = navigation.markdown;
@@ -632,7 +636,9 @@ export default function turndownWebExtension(pi: ExtensionAPI) {
           ? "_No readable content was extracted from this page._"
           : mode === "navigation"
             ? "_No navigation content or links were extracted from this page._"
-            : "_No links matched the requested filters._";
+            : mode === "links"
+              ? "_No links matched the requested filters._"
+              : "_No content returned._";
       }
 
       const truncated = truncateText(markdown, maxCharacters);
@@ -643,13 +649,13 @@ export default function turndownWebExtension(pi: ExtensionAPI) {
         `Mode: ${mode}`,
         `HTTP: ${response.status} ${response.statusText}`,
         ...(contentType ? [`Content-Type: ${contentType.split(";")[0]}`] : []),
-        ...(isProbablyHtml(contentType, rawBody) ? [`Extracted from: ${extractedFrom}`] : []),
+        ...(isProbablyHtml(contentType, rawBody) && mode !== "raw" ? [`Extracted from: ${extractedFrom}`] : []),
         ...(mode === "page" && fallbackUsed ? ["Fallback used: broader body extraction"] : []),
         ...(mode === "page" && keyLinksAdded ? [`Key links added: ${keyLinkCount}`] : []),
         ...(mode === "page" && assessment ? [`Content words: ${assessment.wordCount}`, `Content score: ${assessment.score}`] : []),
-        ...(mode !== "page" ? [`Link scope: ${linkScope}`, `Same site only: ${sameSiteOnly ? "yes" : "no"}`] : []),
+        ...(mode === "navigation" || mode === "links" ? [`Link scope: ${linkScope}`, `Same site only: ${sameSiteOnly ? "yes" : "no"}`] : []),
         ...(mode === "navigation" ? [`Navigation sections: ${sectionCount}`] : []),
-        ...(mode !== "page" ? [`Links returned: ${linkCount}`, `Total links seen: ${totalLinkCount}`] : []),
+        ...(mode === "navigation" || mode === "links" ? [`Links returned: ${linkCount}`, `Total links seen: ${totalLinkCount}`] : []),
         ...(truncated.truncated ? [`Truncated: yes (${truncated.text.length}/${markdown.length} chars returned)`] : []),
       ];
 
