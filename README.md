@@ -11,6 +11,7 @@ Install examples
 - Install a single package from a local clone (preferred for development):
   pi install /home/<you>/Repos/pi-packages/packages/sandbox
   pi install ./packages/notify
+  pi install ./packages/turndown-web
 
 Filtering (enable only specific resources from a package)
 

@@ -1,0 +1,18 @@
+{
+  "name": "@pi-agent/turndown-web",
+  "version": "0.1.0",
+  "description": "Pi package that adds a read_website tool for fetching web pages and converting HTML to Markdown with Turndown",
+  "keywords": ["pi-package"],
+  "files": ["index.ts", "README.md"],
+  "dependencies": {
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
