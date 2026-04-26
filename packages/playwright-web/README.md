@@ -19,24 +19,27 @@ If the download fails, the tool throws a clear error with a manual installation 
 
 ### NixOS
 
-Playwright's downloaded binaries are generic ELF executables that can't run on NixOS. The NixOS community solution is to use `playwright-driver.browsers` from nixpkgs and point the tool at those patched binaries via an environment variable.
+Playwright's downloaded binaries are generic ELF executables that can't run on NixOS. The correct solution is to use the `playwright-driver.browsers` package from nixpkgs, which provides NixOS-patched binaries, and point the extension at them via an environment variable.
 
-Set **one** of the following before starting pi:
+**If you are using the `pi-flake` NixOS module** (the recommended way to run pi on NixOS), this is already wired up for you — `playwright-driver.browsers` is included in the pi user's packages and `PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH` is set in both `pi-run` and `home.sessionVariables`. After running `sudo nixos-rebuild switch`, the extension works with no further configuration.
+
+**If you are running pi outside the NixOS module**, set the following before starting pi:
 
 ```bash
-# Generic fallback (NixOS community convention, applies to all browsers)
-export PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH="$(nix-build '<nixpkgs>' -A playwright-driver.browsers --no-out-link)/chromium-$(nix-instantiate --eval -E '(builtins.fromJSON (builtins.readFile "'$(nix-build '<nixpkgs>' -A playwright-driver --no-out-link)'/browsers.json")).browsers' | python3 -c 'import sys,json; print(next(b["revision"] for b in json.loads(sys.stdin.read()) if b["name"]=="chromium"))')/chrome-linux64/chrome"
+# Determine the chromium revision bundled with your nixpkgs playwright-driver
+DRIVER=$(nix-build '<nixpkgs>' -A playwright-driver --no-out-link)
+BROWSERS=$(nix-build '<nixpkgs>' -A playwright-driver.browsers --no-out-link)
+REV=$(python3 -c "import json; d=json.load(open('$DRIVER/browsers.json')); print(next(b['revision'] for b in d['browsers'] if b['name']=='chromium'))")
 
-# Or, simpler — hardcode the path once you know it:
-export PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH=/nix/store/<hash>-playwright-browsers/chromium-<rev>/chrome-linux64/chrome
-
-# Per-browser variants (take priority over the generic one):
-export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/path/to/chrome
-export PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH=/path/to/firefox
-export PLAYWRIGHT_WEBKIT_EXECUTABLE_PATH=/path/to/webkit
+export PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH="$BROWSERS/chromium-$REV/chrome-linux64/chrome"
+export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
 ```
 
-> **Note:** The nixpkgs `playwright-driver` version must match (major + minor) the `playwright` npm package version bundled with this extension. Check with `nix-instantiate --eval -E '(import <nixpkgs> {}).playwright-driver.version'`.
+> **Version note:** the `playwright-driver` version in your nixpkgs channel must match the major and minor version of the `playwright` npm package bundled with this extension. Check with:
+> ```bash
+> nix-instantiate --eval -E '(import <nixpkgs> {}).playwright-driver.version'
+> ```
+> If there is a mismatch, pin nixpkgs to a commit where the versions align, or update the `playwright` dependency in this package.
 
 ## Parameters
 
