@@ -62,6 +62,28 @@ interface PageResult {
   keyLinkCount: number;
 }
 
+// ─── Executable path overrides ──────────────────────────────────────────────
+//
+// On NixOS (and similar environments), Playwright's downloaded binaries are
+// generic ELF executables that can't run without patching. The NixOS community
+// convention is to set PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH (or a
+// per-browser variant) to a NixOS-compatible binary from playwright-driver.browsers.
+//
+// Supported env vars (per-browser takes priority over the generic fallback):
+//   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+//   PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH
+//   PLAYWRIGHT_WEBKIT_EXECUTABLE_PATH
+//   PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH  (fallback for all browsers)
+
+function getExecutablePathOverride(browserName: BrowserName): string | undefined {
+  const perBrowser = {
+    chromium: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    firefox:  process.env.PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH,
+    webkit:   process.env.PLAYWRIGHT_WEBKIT_EXECUTABLE_PATH,
+  }[browserName];
+  return perBrowser || process.env.PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH || undefined;
+}
+
 // ─── Browser pool ───────────────────────────────────────────────────────────
 //
 // A single browser process is expensive to start (~1-2s). We keep one alive
@@ -115,9 +137,11 @@ async function acquireBrowser(
     await ensureBrowser(browserName, onUpdate);
     onUpdate(`Launching headless ${browserName}...`);
     try {
+      const executablePath = getExecutablePathOverride(browserName);
       return await BROWSER_TYPES[browserName].launch({
         headless: true,
         ...(browserName === "chromium" ? { args: ["--no-sandbox", "--disable-setuid-sandbox"] } : {}),
+        ...(executablePath ? { executablePath } : {}),
       });
     } catch (err) {
       // Launch failed (e.g. binary incompatible with this OS). Remove the
@@ -151,6 +175,21 @@ function releaseBrowser(browserName: BrowserName): void {
 async function ensureBrowser(browserName: BrowserName, onUpdate: (msg: string) => void): Promise<void> {
   // Note: ensureBrowser only downloads/verifies the binary. Actual launching
   // is handled by acquireBrowser so the launch promise can be shared.
+
+  // If an executable path override is configured (e.g. on NixOS via
+  // PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH), skip the registry install
+  // entirely — we'll use the external binary as-is.
+  const override = getExecutablePathOverride(browserName);
+  if (override) {
+    if (!existsSync(override)) {
+      throw new Error(
+        `Executable path override for ${browserName} not found: ${override}\n` +
+        `Check the value of PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH / PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH.`,
+      );
+    }
+    onUpdate(`Using executable override for ${browserName}: ${override}`);
+    return;
+  }
   const { registry } = require("playwright-core/lib/server/registry/index") as {
     registry: {
       resolveBrowsers: (browsers: string[], opts: object) => any[];
