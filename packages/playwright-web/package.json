@@ -1,0 +1,23 @@
+{
+  "name": "@pi-agent/playwright-web",
+  "version": "0.1.0",
+  "description": "Pi package that adds a read_website_browser tool for fetching web pages via a headless Chromium browser, with full JavaScript/SPA support",
+  "keywords": ["pi-package"],
+  "files": ["index.ts", "README.md"],
+  "dependencies": {
+    "playwright": "^1.59.1",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "trustedDependencies": [
+    "koffi",
+    "protobufjs"
+  ]
+}
