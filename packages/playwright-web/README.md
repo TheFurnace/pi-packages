@@ -21,7 +21,7 @@ If the download fails, the tool throws a clear error with a manual installation 
 
 Playwright's downloaded binaries are generic ELF executables that can't run on NixOS. The correct solution is to use the `playwright-driver.browsers` package from nixpkgs, which provides NixOS-patched binaries, and point the extension at them via an environment variable.
 
-**If you are using the `pi-flake` NixOS module** (the recommended way to run pi on NixOS), this is already wired up for you — `playwright-driver.browsers` is included in the pi user's packages and `PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH` is set in both `pi-run` and `home.sessionVariables`. After running `sudo nixos-rebuild switch`, the extension works with no further configuration.
+**If you are using the `pi-flake` NixOS module** (the recommended way to run pi on NixOS), this is already wired up for you — `playwright-driver.browsers` is added to `environment.systemPackages` and `PLAYWRIGHT_LAUNCH_OPTIONS_EXECUTABLE_PATH` is set via `environment.variables` (system-wide, covering all users) and explicitly in `pi-run`. After running `sudo nixos-rebuild switch`, the extension works for any user on the machine with no further configuration.
 
 **If you are running pi outside the NixOS module**, set the following before starting pi:
 
