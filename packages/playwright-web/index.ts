@@ -62,9 +62,86 @@ interface PageResult {
   keyLinkCount: number;
 }
 
-// ─── Browser resolution ──────────────────────────────────────────────────────
+// ─── Browser pool ───────────────────────────────────────────────────────────
+//
+// A single browser process is expensive to start (~1-2s). We keep one alive
+// per browser type and serve each request with a fresh BrowserContext instead
+// (Playwright's equivalent of an incognito window — fully isolated cookies,
+// storage, and auth). The browser is closed automatically after IDLE_TIMEOUT_MS
+// of inactivity, but only once all in-flight requests have finished.
+//
+// Parallel-request safety:
+//   • The launch promise is stored in the pool *before* any await, so two
+//     concurrent cold-launch requests share the same Promise rather than each
+//     spawning their own browser process.
+//   • activeCount tracks how many requests are currently using a browser.
+//     The idle timer is only started when the count drops back to zero.
 
 const BROWSER_TYPES: Record<BrowserName, BrowserType> = { chromium, firefox, webkit };
+
+const IDLE_TIMEOUT_MS = 60_000;
+
+interface PoolEntry {
+  browserPromise: Promise<import("playwright").Browser>;
+  activeCount: number;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const pool = new Map<BrowserName, PoolEntry>();
+
+async function acquireBrowser(
+  browserName: BrowserName,
+  onUpdate: (msg: string) => void,
+): Promise<import("playwright").Browser> {
+  const existing = pool.get(browserName);
+
+  if (existing) {
+    // Wait for any in-progress launch to resolve, then check liveness.
+    const browser = await existing.browserPromise;
+    if (browser.isConnected()) {
+      if (existing.idleTimer) { clearTimeout(existing.idleTimer); existing.idleTimer = null; }
+      existing.activeCount++;
+      return browser;
+    }
+    // Browser has disconnected (crashed, killed). Remove the stale entry and
+    // fall through to a fresh launch below.
+    pool.delete(browserName);
+  }
+
+  // Store the launch promise synchronously *before* any await so that
+  // concurrent callers who reach this point while the launch is in-flight
+  // will hit the `existing` branch above and share this promise.
+  const launchPromise = (async () => {
+    await ensureBrowser(browserName, onUpdate);
+    onUpdate(`Launching headless ${browserName}...`);
+    try {
+      return await BROWSER_TYPES[browserName].launch({
+        headless: true,
+        ...(browserName === "chromium" ? { args: ["--no-sandbox", "--disable-setuid-sandbox"] } : {}),
+      });
+    } catch (err) {
+      // Launch failed (e.g. binary incompatible with this OS). Remove the
+      // entry so the next call gets a fresh attempt rather than re-awaiting
+      // a permanently-rejected promise.
+      pool.delete(browserName);
+      throw err;
+    }
+  })();
+
+  pool.set(browserName, { browserPromise: launchPromise, activeCount: 1, idleTimer: null });
+  return launchPromise;
+}
+
+function releaseBrowser(browserName: BrowserName): void {
+  const entry = pool.get(browserName);
+  if (!entry) return;
+  entry.activeCount--;
+  if (entry.activeCount > 0) return; // still in use by other requests
+  entry.idleTimer = setTimeout(() => {
+    pool.delete(browserName);
+    entry.browserPromise.then((b) => b.close()).catch(() => {});
+  }, IDLE_TIMEOUT_MS);
+}
 
 /**
  * Ensure the Playwright-managed binary for the given browser is installed,
@@ -72,6 +149,8 @@ const BROWSER_TYPES: Record<BrowserName, BrowserType> = { chromium, firefox, web
  * Throws a clear error if installation fails.
  */
 async function ensureBrowser(browserName: BrowserName, onUpdate: (msg: string) => void): Promise<void> {
+  // Note: ensureBrowser only downloads/verifies the binary. Actual launching
+  // is handled by acquireBrowser so the launch promise can be shared.
   const { registry } = require("playwright-core/lib/server/registry/index") as {
     registry: {
       resolveBrowsers: (browsers: string[], opts: object) => any[];
@@ -558,18 +637,9 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
       const maxCharacters = Math.min(params.maxCharacters ?? DEFAULT_MAX_CHARACTERS, MAX_ALLOWED_CHARACTERS);
       const preferMainContent = params.preferMainContent ?? true;
 
-      // ── Ensure browser binary is installed ───────────────────────────────
-      await ensureBrowser(browserName, (msg) => {
+      // ── Acquire browser from pool (warm reuse or cold launch) ──────────
+      const browser = await acquireBrowser(browserName, (msg) => {
         onUpdate?.({ content: [{ type: "text", text: msg }] });
-      });
-
-      onUpdate?.({ content: [{ type: "text", text: `Launching headless ${browserName} for ${url}...` }] });
-
-      // ── Launch browser ────────────────────────────────────────────────────
-      const browserType = BROWSER_TYPES[browserName];
-      const browser = await browserType.launch({
-        headless: true,
-        ...(browserName === "chromium" ? { args: ["--no-sandbox", "--disable-setuid-sandbox"] } : {}),
       });
 
       let rawBody: string;
@@ -577,27 +647,30 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
       let title: string;
       let statusCode: number | null = null;
 
-      try {
-        const context = await browser.newContext({
-          userAgent:
-            browserName === "chromium"
-              ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-              : undefined,
-        });
+      // Each request gets its own isolated BrowserContext (incognito-equivalent).
+      // We close the context — not the browser — when done, leaving the browser
+      // process alive for the next request.
+      const context = await browser.newContext({
+        userAgent:
+          browserName === "chromium"
+            ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            : undefined,
+      });
 
-        // Abort the whole thing if the AbortSignal fires
-        signal?.addEventListener("abort", () => { browser.close().catch(() => {}); });
+      try {
+        // On abort: close just this context, not the shared browser.
+        signal?.addEventListener("abort", () => { context.close().catch(() => {}); });
 
         const page = await context.newPage();
 
-        // Capture HTTP status from the primary navigation response
+        // Capture HTTP status from the primary navigation response.
         page.on("response", (response) => {
           if (response.url() === url || response.url() === finalUrl) {
             statusCode = response.status();
           }
         });
 
-      onUpdate?.({ content: [{ type: "text", text: `Navigating to ${url} (waiting for network idle)...` }] });
+        onUpdate?.({ content: [{ type: "text", text: `Navigating to ${url} (waiting for network idle)...` }] });
 
         const response = await page.goto(url, { waitUntil: "networkidle", timeout: 30_000 });
         if (response) statusCode = response.status();
@@ -606,7 +679,8 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
         title = await page.title();
         rawBody = await page.content();
       } finally {
-        await browser.close();
+        await context.close();
+        releaseBrowser(browserName);
       }
 
       // ── Process content ───────────────────────────────────────────────────
