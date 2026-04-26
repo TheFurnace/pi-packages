@@ -612,7 +612,7 @@ function normalizeBrowser(input?: string): BrowserName {
 }
 
 export default function playwrightWebExtension(pi: ExtensionAPI) {
-  pi.registerTool({
+  const tool = {
     name: "read_website_browser",
     label: "Read Website (Browser)",
     description:
@@ -678,7 +678,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
 
       // ── Acquire browser from pool (warm reuse or cold launch) ──────────
       const browser = await acquireBrowser(browserName, (msg) => {
-        onUpdate?.({ content: [{ type: "text", text: msg }] });
+        onUpdate?.({ content: [{ type: "text", text: msg }], details: undefined });
       });
 
       let rawBody: string;
@@ -709,7 +709,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
           }
         });
 
-        onUpdate?.({ content: [{ type: "text", text: `Navigating to ${url} (waiting for network idle)...` }] });
+        onUpdate?.({ content: [{ type: "text", text: `Navigating to ${url} (waiting for network idle)...` }], details: undefined });
 
         const response = await page.goto(url, { waitUntil: "networkidle", timeout: 30_000 });
         if (response) statusCode = response.status();
@@ -723,7 +723,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
       }
 
       // ── Process content ───────────────────────────────────────────────────
-      onUpdate?.({ content: [{ type: "text", text: `Converting ${finalUrl} to Markdown...` }] });
+      onUpdate?.({ content: [{ type: "text", text: `Converting ${finalUrl} to Markdown...` }], details: undefined });
 
       let extractedFrom: ExtractedFrom = "document";
       let markdown = "";
@@ -825,5 +825,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
         },
       };
     },
-  });
+  } as any;
+
+  pi.registerTool(tool);
 }

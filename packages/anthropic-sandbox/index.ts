@@ -42,7 +42,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { type BashOperations, createBashTool, getAgentDir } from "@mariozechner/pi-coding-agent";
+import { type BashOperations, createBashToolDefinition, createLocalBashOperations, getAgentDir } from "@mariozechner/pi-coding-agent";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -207,25 +207,23 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	const localCwd = process.cwd();
-	const localBash = createBashTool(localCwd);
+	const localBashOps = createLocalBashOperations();
 
 	let sandboxEnabled = false;
 	let sandboxInitialized = false;
 
-	// Override the built-in bash tool with a sandboxed version
-	pi.registerTool({
-		...localBash,
-		label: "bash (sandboxed)",
-		async execute(id, params, signal, onUpdate, ctx) {
-			if (!sandboxEnabled || !sandboxInitialized) {
-				return localBash.execute(id, params, signal, onUpdate, ctx);
-			}
-			const sandboxedBash = createBashTool(localCwd, {
-				operations: createSandboxedBashOps(),
-			});
-			return sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+	// Override the built-in bash tool with a sandbox-aware definition.
+	const sandboxedBashTool = createBashToolDefinition(localCwd, {
+		operations: {
+			async exec(command, cwd, options) {
+				if (!sandboxEnabled || !sandboxInitialized) {
+					return localBashOps.exec(command, cwd, options);
+				}
+				return createSandboxedBashOps().exec(command, cwd, options);
+			},
 		},
-	});
+	}) as any;
+	pi.registerTool(sandboxedBashTool);
 
 	// Also sandbox user-initiated bash (e.g. ! commands in the TUI)
 	pi.on("user_bash", () => {

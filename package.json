@@ -1,0 +1,17 @@
+{
+  "name": "pi-packages",
+  "private": true,
+  "description": "Development workspace for pi extension packages",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "typecheck:watch": "tsc -p tsconfig.json --watch --preserveWatchOutput"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "0.70.2",
+    "@mariozechner/pi-coding-agent": "0.70.2",
+    "@mariozechner/pi-tui": "0.70.2",
+    "@types/node": "^24.3.0",
+    "typebox": "1.1.24",
+    "typescript": "^5.7.3"
+  }
+}

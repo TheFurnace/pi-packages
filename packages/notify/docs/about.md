@@ -75,6 +75,12 @@ The extension assumes focused at session start and updates the state in real tim
 Focus tracking is enabled on `session_start` and cleaned up on `session_shutdown`
 (including `/reload`, `/fork`, `/new`, and `/resume`).
 
+If a notification is still pending, the extension will try to dismiss it when:
+
+- the terminal regains focus
+- a new agent run starts
+- the session shuts down
+
 Most modern terminals support this protocol: Kitty, GNOME Terminal, Alacritty,
 WezTerm, iTerm2, Windows Terminal, and others.
 
@@ -89,8 +95,14 @@ Backends are probed once at `session_start`. The first available one is used:
 | 3 | `powershell.exe` | Windows / WSL (Windows Terminal special case) |
 
 In-band OSC is the preferred default since it works across platforms in modern terminals.
-When running inside Windows Terminal (WT_SESSION) the extension will use PowerShell
+When running inside Windows Terminal (`WT_SESSION`) the extension will use PowerShell
 to show a native toast notification.
+
+Dismissal support currently depends on the backend:
+
+- **OSC 99 (Kitty):** explicit close is supported
+- **PowerShell / Windows toast:** the extension removes its own toast from notification history
+- **OSC 777:** no standard programmatic dismiss is available
 
 > **TODO:** explore additional native backends before falling back to OSC —
 > e.g. `kdialog` (KDE), `dunstify` (dunst), `sw-notify` (sway/wlroots),

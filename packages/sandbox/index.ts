@@ -28,7 +28,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createBashTool, getAgentDir, isToolCallEventType, type BashOperations } from "@mariozechner/pi-coding-agent";
+import { createBashToolDefinition, getAgentDir, isToolCallEventType, type BashOperations } from "@mariozechner/pi-coding-agent";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -379,19 +379,21 @@ export default function (pi: ExtensionAPI) {
     if (!bwrapPath || !enabled) return;
 
     const bwrapArgs = buildBwrapArgs(rules, cwd);
-    const localBash = createBashTool(cwd);
+    const localBash = createBashToolDefinition(cwd);
 
-    pi.registerTool({
+    const sandboxedBashTool = {
       ...localBash,
       label: "bash (sandboxed)",
       async execute(id, params, signal, onUpdate, toolCtx) {
         if (!enabled || !bwrapPath) {
           return localBash.execute(id, params, signal, onUpdate, toolCtx);
         }
-        const sandboxed = createBashTool(cwd, { operations: createSandboxedBashOps(bwrapPath!, bwrapArgs) });
+        const sandboxed = createBashToolDefinition(cwd, { operations: createSandboxedBashOps(bwrapPath!, bwrapArgs) });
         return sandboxed.execute(id, params, signal, onUpdate, toolCtx);
       },
-    });
+    } as any;
+
+    pi.registerTool(sandboxedBashTool);
 
     pi.on("user_bash", () => {
       if (!enabled || !bwrapPath) return;

@@ -44,7 +44,7 @@
  * Requirements: one of the native backends above, or a terminal with OSC support
  */
 
-import type { AgentMessage, ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { execFile } from "node:child_process";
 import path from "node:path";
 
@@ -82,6 +82,10 @@ const SEQ_FOCUS_OUT = "\x1b[O";
 
 type Backend = "powershell" | "osc777" | "osc99";
 
+const WINDOWS_TOAST_APP_ID = "Pi.Notify";
+const WINDOWS_TOAST_GROUP  = "pi";
+const WINDOWS_TOAST_TAG    = `pi-${process.pid}`;
+
 /** Pick OSC variant based on the running terminal. */
 function oscFallback(): "osc777" | "osc99" {
 	return process.env.KITTY_WINDOW_ID ? "osc99" : "osc777";
@@ -103,7 +107,8 @@ function probeBackend(): Backend {
  * Dismiss/close a previously sent notification, where the backend supports it.
  *
  * OSC 99 (Kitty): close the notification with matching id.
- * OSC 777 / PowerShell: no standard close mechanism — no-op.
+ * PowerShell: remove this session's toast from Windows notification history.
+ * OSC 777: no standard close mechanism.
  */
 function dismissNotification(backend: Backend): void {
 	switch (backend) {
@@ -111,30 +116,53 @@ function dismissNotification(backend: Backend): void {
 			// Kitty close sequence: same notification id (i=1), payload close
 			process.stdout.write("\x1b]99;i=1:p=close;\x1b\\");
 			break;
-		case "osc777":
 		case "powershell":
-			// No standard close mechanism available for these backends.
+			runPowershell(windowsDismissScript());
+			break;
+		case "osc777":
+			// No standard close mechanism available for OSC 777.
 			break;
 	}
+}
+
+function psQuote(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
+}
+
+function runPowershell(script: string): void {
+	execFile("powershell.exe", ["-NoProfile", "-Command", script], () => {});
 }
 
 function windowsToastScript(title: string, body: string): string {
 	const type     = "Windows.UI.Notifications";
 	const mgr      = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
-	const template = `[${type}.ToastTemplateType]::ToastText01`;
+	const template = `[${type}.ToastTemplateType]::ToastText02`;
 	const toast    = `[${type}.ToastNotification]::new($xml)`;
 	return [
 		`${mgr} > $null`,
 		`$xml = [${type}.ToastNotificationManager]::GetTemplateContent(${template})`,
-		`$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('${body}')) > $null`,
-		`[${type}.ToastNotificationManager]::CreateToastNotifier('${title}').Show(${toast})`,
+		`$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode(${psQuote(title)})) > $null`,
+		`$xml.GetElementsByTagName('text')[1].AppendChild($xml.CreateTextNode(${psQuote(body)})) > $null`,
+		`$toast = ${toast}`,
+		`$toast.Tag = ${psQuote(WINDOWS_TOAST_TAG)}`,
+		`$toast.Group = ${psQuote(WINDOWS_TOAST_GROUP)}`,
+		`[${type}.ToastNotificationManager]::CreateToastNotifier(${psQuote(WINDOWS_TOAST_APP_ID)}).Show($toast)`,
+	].join("; ");
+}
+
+function windowsDismissScript(): string {
+	const type = "Windows.UI.Notifications";
+	const mgr  = `[${type}.ToastNotificationManager, ${type}, ContentType = WindowsRuntime]`;
+	return [
+		`${mgr} > $null`,
+		`[${type}.ToastNotificationManager]::History.Remove(${psQuote(WINDOWS_TOAST_TAG)}, ${psQuote(WINDOWS_TOAST_GROUP)}, ${psQuote(WINDOWS_TOAST_APP_ID)})`,
 	].join("; ");
 }
 
 function sendNotification(backend: Backend, title: string, body: string): void {
 	switch (backend) {
 		case "powershell":
-			execFile("powershell.exe", ["-NoProfile", "-Command", windowsToastScript(title, body)], () => {});
+			runPowershell(windowsToastScript(title, body));
 			break;
 
 		case "osc777":
@@ -170,7 +198,7 @@ function firstSentence(text: string): string {
  * Find the last assistant message in a messages array and return its text
  * content blocks joined into a single string.
  */
-function extractLastAssistantText(messages: AgentMessage[]): string {
+function extractLastAssistantText(messages: NotificationMessageLike[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i] as any;
 		if (msg.role === "assistant" && Array.isArray(msg.content)) {
@@ -190,6 +218,11 @@ interface ToolEntry {
 	name: string;
 	args: any;
 	isError: boolean;
+}
+
+interface NotificationMessageLike {
+	role?: string;
+	content?: unknown;
 }
 
 /**
@@ -338,7 +371,7 @@ interface RunState {
  */
 async function buildNotification(
 	mode: NotifyMode,
-	messages: AgentMessage[],
+	messages: NotificationMessageLike[],
 	run: RunState,
 	cwd: string,
 	exec: ExtensionAPI["exec"],
@@ -388,12 +421,19 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Per-agent-run state ───────────────────────────────────────────────────
 	let runState: RunState = { startTime: 0, userPrompt: "", toolLog: [] };
+	const pendingToolArgs = new Map<string, unknown>();
 
 	// ── Notification dismissal state ──────────────────────────────────────────
 	/** True while a notification has been sent and not yet dismissed. */
 	let notificationPending = false;
 
 	// ── Focus helpers ─────────────────────────────────────────────────────────
+	function dismissPendingNotification() {
+		if (!notificationPending) return;
+		dismissNotification(backend);
+		notificationPending = false;
+	}
+
 	function enableFocusTracking() {
 		if (trackingActive) return;
 		process.stdout.write(FOCUS_ENABLE);
@@ -401,10 +441,7 @@ export default function (pi: ExtensionAPI) {
 			const str = chunk.toString("binary");
 			if (str.includes(SEQ_FOCUS_IN)) {
 				isFocused = true;
-				if (notificationPending) {
-					dismissNotification(backend);
-					notificationPending = false;
-				}
+				dismissPendingNotification();
 			}
 			if (str.includes(SEQ_FOCUS_OUT)) isFocused = false;
 		};
@@ -428,18 +465,22 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI) return;
 		isFocused = true;
 		backend   = probeBackend();
+		notificationPending = false;
 		enableFocusTracking();
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
+		dismissPendingNotification();
 		disableFocusTracking();
 	});
 
 	// ── Per-run tracking ──────────────────────────────────────────────────────
 
-	/** Capture the user's original prompt and reset per-run state. */
+	/** Capture the user's original prompt, dismiss stale notifications, and reset per-run state. */
 	pi.on("before_agent_start", async (event, _ctx) => {
+		dismissPendingNotification();
+		pendingToolArgs.clear();
 		runState = {
 			startTime:  Date.now(),
 			userPrompt: event.prompt.trim(),
@@ -447,11 +488,17 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	/** Track every tool call for the tool-activity summary. */
+	/** Capture tool arguments on start, then record the completed call on end. */
+	pi.on("tool_execution_start", async (event, _ctx) => {
+		pendingToolArgs.set(event.toolCallId, event.args);
+	});
+
 	pi.on("tool_execution_end", async (event, _ctx) => {
+		const args = pendingToolArgs.get(event.toolCallId);
+		pendingToolArgs.delete(event.toolCallId);
 		runState.toolLog.push({
 			name:    event.toolName,
-			args:    event.args,
+			args,
 			isError: event.isError,
 		});
 	});

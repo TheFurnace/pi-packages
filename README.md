@@ -42,6 +42,10 @@ Notes on patterns
 
 Local-development workflow
 
+- Install workspace dependencies and run type checks from the repo root:
+  pnpm install
+  pnpm typecheck
+
 - Clone this repo and install a single package directly by path while iterating:
   git clone git@github.com:TheFurnace/pi-packages.git
   pi install ./pi-packages/packages/sandbox

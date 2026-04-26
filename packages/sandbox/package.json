@@ -4,6 +4,9 @@
   "description": "Filesystem sandbox extension for pi — two-layer access policy via in-process interception and bwrap OS enforcement",
   "keywords": ["pi-package"],
   "files": ["index.ts", "docs/"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   }

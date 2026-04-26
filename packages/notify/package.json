@@ -4,6 +4,9 @@
   "description": "Focus-aware desktop/terminal notification for pi — fires when the agent finishes and the terminal is not the active window",
   "keywords": ["pi-package"],
   "files": ["index.ts", "docs/"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   }

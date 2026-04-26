@@ -514,7 +514,7 @@ function truncateText(text: string, maxCharacters: number): { text: string; trun
 }
 
 export default function turndownWebExtension(pi: ExtensionAPI) {
-  pi.registerTool({
+  const tool = {
     name: "read_website",
     label: "Read Website",
     description: "Fetch a web page over HTTP(S) and convert its HTML to Markdown for general page reading, navigation inspection, or link extraction.",
@@ -566,6 +566,7 @@ export default function turndownWebExtension(pi: ExtensionAPI) {
 
       onUpdate?.({
         content: [{ type: "text", text: `Fetching ${url}...` }],
+        details: undefined,
       });
 
       const response = await fetch(url, {
@@ -599,6 +600,7 @@ export default function turndownWebExtension(pi: ExtensionAPI) {
       if (isProbablyHtml(contentType, rawBody)) {
         onUpdate?.({
           content: [{ type: "text", text: `Converting ${finalUrl} to Markdown with Turndown...` }],
+          details: undefined,
         });
 
         if (mode === "raw") {
@@ -685,5 +687,7 @@ export default function turndownWebExtension(pi: ExtensionAPI) {
         },
       };
     },
-  });
+  } as any;
+
+  pi.registerTool(tool);
 }

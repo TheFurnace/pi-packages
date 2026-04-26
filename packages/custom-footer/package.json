@@ -4,6 +4,11 @@
   "description": "Replicates pi's built-in footer via ctx.ui.setFooter() — a reference implementation and starting point for custom footers",
   "keywords": ["pi-package"],
   "files": ["index.ts"],
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   }

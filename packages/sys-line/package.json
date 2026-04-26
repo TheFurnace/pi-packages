@@ -4,6 +4,9 @@
   "description": "Appends 'as <username>' to the pi footer via a status line",
   "keywords": ["pi-package"],
   "files": ["index.ts"],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   }

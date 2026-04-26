@@ -7,6 +7,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.26"
   }
