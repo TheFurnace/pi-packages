@@ -13,14 +13,9 @@ A pi extension that provides a `read_website_browser` tool — a headless-Chromi
 
 ## Browser binary resolution
 
-The tool resolves a usable Chromium binary in priority order:
+All binaries are managed by Playwright — no system browser is used or required. On first use of a given browser, the tool downloads its Playwright-pinned binary programmatically via `playwright-core`'s internal registry API (no CLI, no npx). The binary is cached in `~/.cache/ms-playwright/` and reused on subsequent calls.
 
-1. **`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` env var** — explicit override, always wins.
-2. **Playwright-managed binary** (`~/.cache/ms-playwright/`) — downloaded and cached the first time by Playwright's registry API (no CLI, no npx). Works on standard Linux, macOS, and Windows.
-3. **Programmatic install** — if the managed binary isn't present yet, the tool triggers a download automatically via `playwright-core`'s internal registry API.
-4. **System Chromium fallback** — if the downloaded binary can't execute (e.g. on NixOS where generic ELF binaries can't run), the tool scans `PATH`, well-known paths, and the Nix store for a working Chromium.
-
-If no usable Chromium is found, the tool throws a helpful error with remediation steps.
+If the download fails, the tool throws a clear error with a manual installation command.
 
 ## Parameters
 
@@ -28,6 +23,7 @@ If no usable Chromium is found, the tool throws a helpful error with remediation
 |---|---|---|---|
 | `url` | string | required | HTTP/HTTPS URL to fetch |
 | `mode` | string | `"page"` | `"page"` \| `"navigation"` \| `"links"` \| `"raw"` |
+| `browser` | string | `"chromium"` | `"chromium"` \| `"firefox"` \| `"webkit"` |
 | `linkScope` | string | `"all"` | `"all"` \| `"internal"` \| `"external"` |
 | `sameSiteOnly` | boolean | `false` | Restrict links to same site |
 | `maxCharacters` | integer | `20000` | Max characters to return (cap: 100000) |

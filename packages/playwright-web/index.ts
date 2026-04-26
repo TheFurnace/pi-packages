@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { existsSync, readdirSync } from "fs";
-import { execSync, execFileSync } from "child_process";
-import { chromium } from "playwright";
+import { existsSync } from "fs";
+import { chromium, firefox, webkit } from "playwright";
+import type { BrowserType } from "playwright";
 import TurndownService from "turndown";
 import TurndownPluginGfm from "turndown-plugin-gfm";
 import { Type } from "typebox";
@@ -16,6 +16,7 @@ const { gfm } = TurndownPluginGfm as { gfm?: (service: TurndownService) => void 
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+type BrowserName = "chromium" | "firefox" | "webkit";
 type ExtractedFrom = "main" | "article" | "body" | "document" | "navigation" | "links";
 type ReadMode = "page" | "navigation" | "links" | "raw";
 type LinkScope = "all" | "internal" | "external";
@@ -63,85 +64,14 @@ interface PageResult {
 
 // ─── Browser resolution ──────────────────────────────────────────────────────
 
-/**
- * Verify a binary is actually executable on this OS.
- * On NixOS, Playwright's downloaded Chromium binaries exist on disk but fail
- * with exit code 127 because the dynamic linker is not in the expected location.
- */
-function isBinaryExecutable(path: string): boolean {
-  try {
-    execFileSync(path, ["--version"], { timeout: 5_000, stdio: "pipe" });
-    return true;
-  } catch (e: any) {
-    if (e.status === 127) return false;
-    const stderr: string = e.stderr?.toString() ?? "";
-    if (stderr.includes("stub-ld") || stderr.includes("dynamically linked")) return false;
-    // A non-zero exit from --version is still a working binary (some Chrome builds do this).
-    return true;
-  }
-}
-
-/** Search common locations for a system-installed Chromium binary. */
-function findSystemChromium(): string | null {
-  // 1. Explicit env override
-  const envPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ?? process.env.CHROMIUM_PATH;
-  if (envPath && existsSync(envPath) && isBinaryExecutable(envPath)) return envPath;
-
-  // 2. PATH lookup
-  for (const name of ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]) {
-    try {
-      const found = execSync(`command -v ${name}`, {
-        encoding: "utf8",
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
-      if (found && existsSync(found) && isBinaryExecutable(found)) return found;
-    } catch {
-      // not found on PATH — continue
-    }
-  }
-
-  // 3. NixOS nix store scan (Playwright binaries are dynamically linked and won't run on NixOS,
-  //    but the system may have a Nix-built Chromium that works fine)
-  try {
-    if (existsSync("/nix/store")) {
-      const found = readdirSync("/nix/store")
-        .filter((e) => /^[a-z0-9]+-chromium-[\d.]+$/.test(e))
-        .map((e) => `/nix/store/${e}/bin/chromium`)
-        .filter((p) => existsSync(p) && isBinaryExecutable(p))
-        .sort();
-      if (found.length > 0) return found[found.length - 1]!;
-    }
-  } catch {
-    // nix store not accessible — ignore
-  }
-
-  // 4. Well-known fixed paths
-  for (const p of [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  ]) {
-    if (existsSync(p) && isBinaryExecutable(p)) return p;
-  }
-
-  return null;
-}
+const BROWSER_TYPES: Record<BrowserName, BrowserType> = { chromium, firefox, webkit };
 
 /**
- * Resolve a usable Chromium executable path using the following priority:
- *
- * 1. Playwright-managed binary (already downloaded and functional).
- * 2. Programmatic install via the Playwright registry API (no CLI, no npx).
- * 3. System Chromium (fallback for environments like NixOS where downloaded
- *    generic Linux binaries can't run).
- *
- * Throws if no usable Chromium is found.
+ * Ensure the Playwright-managed binary for the given browser is installed,
+ * downloading it programmatically if needed (no CLI, no npx).
+ * Throws a clear error if installation fails.
  */
-async function resolveChromiumPath(onUpdate: (msg: string) => void): Promise<string> {
-  // Lazy-require to avoid hard failures if playwright-core internals change.
+async function ensureBrowser(browserName: BrowserName, onUpdate: (msg: string) => void): Promise<void> {
   const { registry } = require("playwright-core/lib/server/registry/index") as {
     registry: {
       resolveBrowsers: (browsers: string[], opts: object) => any[];
@@ -149,44 +79,33 @@ async function resolveChromiumPath(onUpdate: (msg: string) => void): Promise<str
     };
   };
 
-  const executables = registry.resolveBrowsers(["chromium"], {});
-  const pwChromium = executables.find((e: any) => e.name === "chromium");
-  const pwPath: string | undefined = pwChromium?.executablePath?.("javascript");
+  const executables = registry.resolveBrowsers([browserName], {});
+  const pw = executables.find((e: any) => e.name === browserName);
+  const exePath: string | undefined = pw?.executablePath?.("javascript");
 
-  // Case 1: already installed and runnable
-  if (pwPath && existsSync(pwPath) && isBinaryExecutable(pwPath)) {
-    onUpdate(`Using Playwright-managed Chromium: ${pwPath}`);
-    return pwPath;
+  if (exePath && existsSync(exePath)) {
+    onUpdate(`Using Playwright-managed ${browserName}: ${exePath}`);
+    return;
   }
 
-  // Case 2: not yet downloaded — try programmatic install
-  if (pwPath && !existsSync(pwPath)) {
-    try {
-      onUpdate("Playwright Chromium not installed — downloading (this only happens once)...");
-      await registry.install(executables, { force: false });
-      const installedPath: string | undefined = pwChromium?.executablePath?.("javascript");
-      if (installedPath && existsSync(installedPath) && isBinaryExecutable(installedPath)) {
-        onUpdate(`Playwright Chromium installed: ${installedPath}`);
-        return installedPath;
-      }
-    } catch (e: any) {
-      onUpdate(`Playwright install failed (${String(e.message).slice(0, 120)}) — trying system fallback...`);
-    }
+  onUpdate(`Playwright ${browserName} not installed — downloading (this only happens once)...`);
+  try {
+    await registry.install(executables, { force: false });
+  } catch (e: any) {
+    throw new Error(
+      `Failed to install Playwright ${browserName}: ${String(e.message)}\n` +
+      `Run 'bun run playwright install ${browserName}' in the playwright-web package directory to install manually.`,
+    );
   }
 
-  // Case 3: system Chromium fallback (e.g. NixOS)
-  const systemPath = findSystemChromium();
-  if (systemPath) {
-    onUpdate(`Using system Chromium: ${systemPath}`);
-    return systemPath;
+  const installedPath: string | undefined = pw?.executablePath?.("javascript");
+  if (!installedPath || !existsSync(installedPath)) {
+    throw new Error(
+      `Playwright ${browserName} download completed but binary not found at expected path.\n` +
+      `Expected: ${installedPath ?? "(unknown)"}`,
+    );
   }
-
-  throw new Error(
-    "No usable Chromium binary found.\n" +
-    "Options:\n" +
-    "  • Set the PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH environment variable to a working Chromium binary.\n" +
-    "  • Install Chromium on your system (e.g. `nix-env -iA nixpkgs.chromium`).",
-  );
+  onUpdate(`Playwright ${browserName} installed: ${installedPath}`);
 }
 
 // ─── URL helpers ─────────────────────────────────────────────────────────────
@@ -568,12 +487,18 @@ function truncateText(text: string, maxCharacters: number): { text: string; trun
 
 // ─── Extension entry point ───────────────────────────────────────────────────
 
+function normalizeBrowser(input?: string): BrowserName {
+  const name = (input ?? "chromium").trim().toLowerCase();
+  if (name === "chromium" || name === "firefox" || name === "webkit") return name as BrowserName;
+  throw new Error('Invalid browser. Expected "chromium", "firefox", or "webkit".');
+}
+
 export default function playwrightWebExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "read_website_browser",
     label: "Read Website (Browser)",
     description:
-      "Fetch a web page using a headless Chromium browser, with full JavaScript execution and SPA support, then convert its HTML to Markdown.",
+      "Fetch a web page using a headless browser (Chromium, Firefox, or WebKit), with full JavaScript execution and SPA support, then convert its HTML to Markdown.",
     promptSnippet:
       "Fetch an HTTP(S) page using a real headless browser (JavaScript enabled, SPA-friendly) and convert it to Markdown.",
     promptGuidelines: [
@@ -582,6 +507,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
       "Use read_website_browser with mode navigation when the user wants menus, site structure, or navigational links from a JavaScript-rendered page.",
       "Use read_website_browser with mode links when the user wants only the links from a JavaScript-rendered page.",
       "Use read_website_browser with mode raw to get the fully-rendered HTML source of an SPA, useful for inspecting embedded JSON or finding internal API endpoints.",
+      'The browser parameter selects the engine: "chromium" (default), "firefox", or "webkit". Chromium is the best default for most pages.',
     ],
     parameters: Type.Object({
       url: Type.String({
@@ -591,6 +517,11 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
         Type.String({
           description:
             'Read mode: "page" (default) for readable Markdown content, "navigation" for nav/header/footer/aside content plus links, "links" for just links, or "raw" for the fully-rendered HTML source.',
+        }),
+      ),
+      browser: Type.Optional(
+        Type.String({
+          description: 'Browser engine to use: "chromium" (default), "firefox", or "webkit". Each is a distinct Playwright-managed binary pinned to this Playwright version.',
         }),
       ),
       linkScope: Type.Optional(
@@ -621,23 +552,24 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate) {
       const url = normalizeUrl(params.url);
       const mode = normalizeMode(params.mode);
+      const browserName = normalizeBrowser(params.browser);
       const linkScope = normalizeLinkScope(params.linkScope);
       const sameSiteOnly = params.sameSiteOnly ?? false;
       const maxCharacters = Math.min(params.maxCharacters ?? DEFAULT_MAX_CHARACTERS, MAX_ALLOWED_CHARACTERS);
       const preferMainContent = params.preferMainContent ?? true;
 
-      // ── Resolve Chromium ──────────────────────────────────────────────────
-      const executablePath = await resolveChromiumPath((msg) => {
+      // ── Ensure browser binary is installed ───────────────────────────────
+      await ensureBrowser(browserName, (msg) => {
         onUpdate?.({ content: [{ type: "text", text: msg }] });
       });
 
-      onUpdate?.({ content: [{ type: "text", text: `Launching headless Chromium for ${url}...` }] });
+      onUpdate?.({ content: [{ type: "text", text: `Launching headless ${browserName} for ${url}...` }] });
 
       // ── Launch browser ────────────────────────────────────────────────────
-      const browser = await chromium.launch({
+      const browserType = BROWSER_TYPES[browserName];
+      const browser = await browserType.launch({
         headless: true,
-        executablePath,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+        ...(browserName === "chromium" ? { args: ["--no-sandbox", "--disable-setuid-sandbox"] } : {}),
       });
 
       let rawBody: string;
@@ -648,7 +580,9 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
       try {
         const context = await browser.newContext({
           userAgent:
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            browserName === "chromium"
+              ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+              : undefined,
         });
 
         // Abort the whole thing if the AbortSignal fires
@@ -663,7 +597,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
           }
         });
 
-        onUpdate?.({ content: [{ type: "text", text: `Navigating to ${url} (waiting for network idle)...` }] });
+      onUpdate?.({ content: [{ type: "text", text: `Navigating to ${url} (waiting for network idle)...` }] });
 
         const response = await page.goto(url, { waitUntil: "networkidle", timeout: 30_000 });
         if (response) statusCode = response.status();
@@ -733,6 +667,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
         ...(finalUrl !== url ? [`Final URL: ${finalUrl}`] : []),
         ...(title ? [`Title: ${title}`] : []),
         `Mode: ${mode}`,
+        `Browser: ${browserName}`,
         ...(statusCode !== null ? [`HTTP: ${statusCode}`] : []),
         ...(mode !== "raw" ? [`Extracted from: ${extractedFrom}`] : []),
         ...(mode === "page" && fallbackUsed ? ["Fallback used: broader body extraction"] : []),
@@ -759,6 +694,7 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
           finalUrl,
           title,
           mode,
+          browser: browserName,
           linkScope,
           sameSiteOnly,
           statusCode,
