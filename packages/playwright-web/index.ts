@@ -1,7 +1,9 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { existsSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
+import { tmpdir } from "os";
+import { dirname, join } from "path";
 import { chromium, firefox, webkit } from "playwright";
-import type { BrowserType } from "playwright";
+import type { BrowserContext, BrowserType, Page } from "playwright";
 import TurndownService from "turndown";
 import TurndownPluginGfm from "turndown-plugin-gfm";
 import { Type } from "typebox";
@@ -603,6 +605,380 @@ function truncateText(text: string, maxCharacters: number): { text: string; trun
   return { text: `${slice.slice(0, cutoff).trimEnd()}\n\n…[truncated]`, truncated: true };
 }
 
+// ─── Interactive browser session helpers ────────────────────────────────────
+
+const SESSION_IDLE_TIMEOUT_MS = 10 * 60_000;
+const MAX_SNAPSHOT_ELEMENTS = 80;
+const DEFAULT_SNAPSHOT_CHARACTERS = 20_000;
+const DEFAULT_LOG_ENTRIES = 100;
+
+type WaitUntil = "load" | "domcontentloaded" | "networkidle";
+
+interface CapturedConsoleEntry {
+  index: number;
+  timestamp: string;
+  type: string;
+  text: string;
+  location?: unknown;
+}
+
+interface CapturedNetworkEntry {
+  index: number;
+  timestamp: string;
+  kind: "requestfailed" | "response";
+  method: string;
+  url: string;
+  status?: number;
+  statusText?: string;
+  failure?: string;
+}
+
+interface BrowserSession {
+  id: string;
+  browserName: BrowserName;
+  context: BrowserContext;
+  page: Page;
+  createdAt: number;
+  lastUsedAt: number;
+  consoleEntries: CapturedConsoleEntry[];
+  pageErrors: CapturedConsoleEntry[];
+  networkEntries: CapturedNetworkEntry[];
+  lastConsoleCursor: number;
+  lastPageErrorCursor: number;
+  lastNetworkCursor: number;
+  artifactDir: string;
+  screenshotCount: number;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const sessions = new Map<string, BrowserSession>();
+let nextSessionId = 1;
+let nextConsoleIndex = 1;
+let nextNetworkIndex = 1;
+
+function makeSessionId(): string {
+  return `browser-${Date.now().toString(36)}-${nextSessionId++}`;
+}
+
+function normalizeInteractiveUrl(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) throw new Error("URL is required");
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  if (/^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::|\/|$)/i.test(trimmed)) {
+    return `http://${trimmed}`;
+  }
+  return `https://${trimmed}`;
+}
+
+function normalizeWaitUntil(input?: string, fallback: WaitUntil = "domcontentloaded"): WaitUntil {
+  const value = (input ?? fallback).trim().toLowerCase();
+  if (value === "load" || value === "domcontentloaded" || value === "networkidle") return value;
+  throw new Error('Invalid waitUntil. Expected "load", "domcontentloaded", or "networkidle".');
+}
+
+function normalizeSnapshotMode(input?: string): "visible-elements" | "text" | "html" {
+  const value = (input ?? "visible-elements").trim().toLowerCase();
+  if (value === "visible-elements" || value === "text" || value === "html") return value as any;
+  if (value === "accessibility") return "visible-elements";
+  throw new Error('Invalid mode. Expected "visible-elements", "text", "html", or "accessibility".');
+}
+
+function touchSession(session: BrowserSession): void {
+  session.lastUsedAt = Date.now();
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  session.idleTimer = setTimeout(() => {
+    closeBrowserSession(session.id).catch(() => {});
+  }, SESSION_IDLE_TIMEOUT_MS);
+}
+
+async function closeBrowserSession(sessionId: string): Promise<boolean> {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  sessions.delete(sessionId);
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  try {
+    await session.context.close();
+  } finally {
+    releaseBrowser(session.browserName);
+  }
+  return true;
+}
+
+async function closeAllBrowserResources(): Promise<{ sessionsClosed: number; browsersClosed: number }> {
+  const sessionIds = Array.from(sessions.keys());
+  await Promise.all(sessionIds.map((id) => closeBrowserSession(id).catch(() => false)));
+
+  const entries = Array.from(pool.entries());
+  pool.clear();
+  await Promise.all(entries.map(async ([, entry]) => {
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    try {
+      const browser = await entry.browserPromise;
+      if (browser.isConnected()) await browser.close();
+    } catch {
+      // Best-effort cleanup during harness/session teardown.
+    }
+  }));
+
+  return { sessionsClosed: sessionIds.length, browsersClosed: entries.length };
+}
+
+function getBrowserSession(sessionId: string): BrowserSession {
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error(`Unknown browser session: ${sessionId}`);
+  if (session.page.isClosed()) {
+    sessions.delete(sessionId);
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.context.close().catch(() => {});
+    releaseBrowser(session.browserName);
+    throw new Error(`Browser session is closed: ${sessionId}`);
+  }
+  touchSession(session);
+  return session;
+}
+
+function registerSessionListeners(session: BrowserSession): void {
+  const page = session.page;
+  page.on("console", (message) => {
+    session.consoleEntries.push({
+      index: nextConsoleIndex++,
+      timestamp: new Date().toISOString(),
+      type: message.type(),
+      text: message.text(),
+      location: message.location(),
+    });
+    if (session.consoleEntries.length > 500) session.consoleEntries.splice(0, session.consoleEntries.length - 500);
+  });
+  page.on("pageerror", (error) => {
+    session.pageErrors.push({
+      index: nextConsoleIndex++,
+      timestamp: new Date().toISOString(),
+      type: "pageerror",
+      text: error.stack || error.message || String(error),
+    });
+    if (session.pageErrors.length > 200) session.pageErrors.splice(0, session.pageErrors.length - 200);
+  });
+  page.on("requestfailed", (request) => {
+    session.networkEntries.push({
+      index: nextNetworkIndex++,
+      timestamp: new Date().toISOString(),
+      kind: "requestfailed",
+      method: request.method(),
+      url: request.url(),
+      failure: request.failure()?.errorText,
+    });
+    if (session.networkEntries.length > 500) session.networkEntries.splice(0, session.networkEntries.length - 500);
+  });
+  page.on("response", (response) => {
+    const status = response.status();
+    if (status < 400) return;
+    session.networkEntries.push({
+      index: nextNetworkIndex++,
+      timestamp: new Date().toISOString(),
+      kind: "response",
+      method: response.request().method(),
+      url: response.url(),
+      status,
+      statusText: response.statusText(),
+    });
+    if (session.networkEntries.length > 500) session.networkEntries.splice(0, session.networkEntries.length - 500);
+  });
+}
+
+async function createBrowserSession(
+  browserName: BrowserName,
+  options: { viewport?: { width: number; height: number }; deviceScaleFactor?: number },
+  onUpdate: (msg: string) => void,
+): Promise<BrowserSession> {
+  const browser = await acquireBrowser(browserName, onUpdate);
+  const sessionId = makeSessionId();
+  const artifactDir = join(tmpdir(), "pi-playwright-web", sessionId);
+  mkdirSync(artifactDir, { recursive: true });
+  try {
+    const context = await browser.newContext({
+      ...(options.viewport ? { viewport: options.viewport } : {}),
+      ...(options.deviceScaleFactor ? { deviceScaleFactor: options.deviceScaleFactor } : {}),
+      userAgent:
+        browserName === "chromium"
+          ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          : undefined,
+    });
+    const page = await context.newPage();
+    const session: BrowserSession = {
+      id: sessionId,
+      browserName,
+      context,
+      page,
+      createdAt: Date.now(),
+      lastUsedAt: Date.now(),
+      consoleEntries: [],
+      pageErrors: [],
+      networkEntries: [],
+      lastConsoleCursor: 0,
+      lastPageErrorCursor: 0,
+      lastNetworkCursor: 0,
+      artifactDir,
+      screenshotCount: 0,
+      idleTimer: null,
+    };
+    registerSessionListeners(session);
+    sessions.set(sessionId, session);
+    touchSession(session);
+    return session;
+  } catch (err) {
+    releaseBrowser(browserName);
+    throw err;
+  }
+}
+
+async function getVisibleText(page: Page): Promise<string> {
+  return await page.evaluate(() => {
+    const body = (globalThis as any).document?.body;
+    return (body?.innerText || "").trim();
+  });
+}
+
+async function getInteractiveElements(page: Page): Promise<Array<Record<string, string>>> {
+  return await page.evaluate((limit) => {
+    const doc = (globalThis as any).document;
+    const win = (globalThis as any).window;
+    if (!doc) return [];
+    const selector = "a,button,input,textarea,select,summary,[role],[data-testid]";
+    const nodes = Array.from(doc.querySelectorAll(selector));
+    function isVisible(el: any): boolean {
+      const style = win.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style && style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+    }
+    function textOf(el: any): string {
+      const parts = [
+        el.getAttribute("aria-label"),
+        el.getAttribute("title"),
+        el.getAttribute("placeholder"),
+        el.labels ? Array.from(el.labels).map((l: any) => l.innerText).join(" ") : "",
+        el.innerText,
+        el.value && el.tagName !== "INPUT" ? el.value : "",
+      ];
+      return parts.filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 120);
+    }
+    function roleOf(el: any): string {
+      const explicit = el.getAttribute("role");
+      if (explicit) return explicit;
+      const tag = el.tagName.toLowerCase();
+      if (tag === "a") return "link";
+      if (tag === "button") return "button";
+      if (tag === "select") return "combobox";
+      if (tag === "textarea") return "textbox";
+      if (tag === "summary") return "button";
+      if (tag === "input") {
+        const type = (el.getAttribute("type") || "text").toLowerCase();
+        if (type === "checkbox") return "checkbox";
+        if (type === "radio") return "radio";
+        if (type === "submit" || type === "button") return "button";
+        return "textbox";
+      }
+      return tag;
+    }
+    return nodes.filter(isVisible).slice(0, limit).map((el: any) => ({
+      role: roleOf(el),
+      name: textOf(el),
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute("type") || "",
+      testId: el.getAttribute("data-testid") || "",
+      href: el.getAttribute("href") || "",
+    }));
+  }, MAX_SNAPSHOT_ELEMENTS);
+}
+
+function formatElements(elements: Array<Record<string, string>>): string {
+  if (elements.length === 0) return "_No visible interactive elements found._";
+  return elements.map((el) => {
+    const bits = [el.role || el.tag, el.name ? `"${el.name}"` : "", el.testId ? `data-testid=${el.testId}` : "", el.type ? `type=${el.type}` : ""].filter(Boolean);
+    return `- ${bits.join(" ")}`;
+  }).join("\n");
+}
+
+async function buildSessionSnapshot(page: Page, mode: "visible-elements" | "text" | "html", maxCharacters: number): Promise<string> {
+  const url = page.url();
+  const title = await page.title();
+  if (mode === "html") {
+    const html = await page.content();
+    const truncated = truncateText(html, maxCharacters);
+    return `URL: ${url}\nTitle: ${title}\nMode: html\n\n---\n\n${truncated.text}`;
+  }
+  const visibleText = await getVisibleText(page);
+  if (mode === "text") {
+    const truncated = truncateText(visibleText || "_No visible text found._", maxCharacters);
+    return `URL: ${url}\nTitle: ${title}\nMode: text\n\n---\n\n${truncated.text}`;
+  }
+  const elements = await getInteractiveElements(page);
+  const textPreview = truncateText(visibleText || "_No visible text found._", Math.min(maxCharacters, 8_000)).text;
+  const snapshot = `URL: ${url}\nTitle: ${title}\nMode: visible-elements\n\n## Visible interactive elements\n\n${formatElements(elements)}\n\n## Visible text\n\n${textPreview}`;
+  return truncateText(snapshot, maxCharacters).text;
+}
+
+async function summarizeCurrentPage(session: BrowserSession): Promise<string> {
+  return buildSessionSnapshot(session.page, "visible-elements", 8_000);
+}
+
+async function resolveLocator(page: Page, params: any): Promise<{ locator: any; description: string }> {
+  if (params.role) {
+    return { locator: page.getByRole(params.role as any, params.name ? { name: params.name, exact: params.exact ?? false } : undefined), description: `role=${params.role}${params.name ? ` name=${JSON.stringify(params.name)}` : ""}` };
+  }
+  if (params.label) return { locator: page.getByLabel(params.label, { exact: params.exact ?? false }), description: `label=${JSON.stringify(params.label)}` };
+  if (params.placeholder) return { locator: page.getByPlaceholder(params.placeholder, { exact: params.exact ?? false }), description: `placeholder=${JSON.stringify(params.placeholder)}` };
+  if (params.testId) return { locator: page.getByTestId(params.testId), description: `testId=${JSON.stringify(params.testId)}` };
+  if (params.text) return { locator: page.getByText(params.text, { exact: params.exact ?? false }), description: `text=${JSON.stringify(params.text)}` };
+  if (params.css) return { locator: page.locator(params.css), description: `css=${JSON.stringify(params.css)}` };
+  throw new Error("No locator provided. Use role/name, label, placeholder, testId, text, or css.");
+}
+
+async function assertSingleLocator(page: Page, params: any): Promise<{ locator: any; description: string; count: number }> {
+  const resolved = await resolveLocator(page, params);
+  const count = await resolved.locator.count();
+  if (count === 0) {
+    const candidates = formatElements(await getInteractiveElements(page));
+    throw new Error(`Locator matched no elements (${resolved.description}). Candidate visible elements:\n${candidates}`);
+  }
+  if (count > 1 && params.nth === undefined) {
+    throw new Error(`Locator matched ${count} elements (${resolved.description}). Provide a more specific locator or nth.`);
+  }
+  return { locator: params.nth !== undefined ? resolved.locator.nth(params.nth) : resolved.locator.first(), description: resolved.description, count };
+}
+
+function formatEvalValue(value: unknown, maxCharacters: number): string {
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value, null, 2);
+    } catch {
+      text = String(value);
+    }
+  }
+  if (text === undefined) text = "undefined";
+  return truncateText(text, maxCharacters).text;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function makeTextResult(text: string, details: Record<string, unknown> = {}) {
+  return { content: [{ type: "text", text }], details };
+}
+
 // ─── Extension entry point ───────────────────────────────────────────────────
 
 function normalizeBrowser(input?: string): BrowserName {
@@ -612,6 +988,14 @@ function normalizeBrowser(input?: string): BrowserName {
 }
 
 export default function playwrightWebExtension(pi: ExtensionAPI) {
+  // Pi emits session_shutdown when the current extension runtime is torn down
+  // for /reload, /new, /resume, /fork, or quit. Clean up persistent browser
+  // sessions and pooled browser processes here so reloaded/replaced sessions do
+  // not inherit stale Playwright children from the old extension instance.
+  pi.on("session_shutdown", async () => {
+    await closeAllBrowserResources();
+  });
+
   const tool = {
     name: "read_website_browser",
     label: "Read Website (Browser)",
@@ -827,5 +1211,394 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
     },
   } as any;
 
+  const browserOpenTool = {
+    name: "browser_open",
+    label: "Browser Open",
+    description: "Open a URL in a persistent Playwright browser session for local web development and interactive debugging.",
+    promptSnippet: "Open a URL in a persistent browser session and return a sessionId for further browser tools.",
+    promptGuidelines: [
+      "Use browser_open after starting a local web development server with bash.",
+      "For localhost URLs, include the port; schemeless localhost URLs default to http://.",
+      "Reuse the returned sessionId with browser_snapshot, browser_interact, browser_logs, and browser_screenshot.",
+      "Use read_website_browser for content extraction; use browser_open and related browser_* tools for interactive app testing.",
+    ],
+    parameters: Type.Object({
+      url: Type.String({ description: "URL to open. localhost/127.0.0.1 URLs without a scheme default to http://; other schemeless URLs default to https://." }),
+      sessionId: Type.Optional(Type.String({ description: "Existing browser session to reuse. If omitted, creates a new session." })),
+      browser: Type.Optional(Type.String({ description: 'Browser engine: "chromium" (default), "firefox", or "webkit". Used only when creating a new session.' })),
+      waitUntil: Type.Optional(Type.String({ description: 'Navigation wait condition: "domcontentloaded" (default), "load", or "networkidle".' })),
+      timeoutMs: Type.Optional(Type.Integer({ description: "Navigation timeout in milliseconds. Default 30000.", minimum: 1 })),
+      viewport: Type.Optional(Type.Object({ width: Type.Integer({ minimum: 1 }), height: Type.Integer({ minimum: 1 }) })),
+      deviceScaleFactor: Type.Optional(Type.Integer({ description: "Device scale factor for new sessions.", minimum: 1 })),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate) {
+      const url = normalizeInteractiveUrl(params.url);
+      const waitUntil = normalizeWaitUntil(params.waitUntil, "domcontentloaded");
+      const timeout = params.timeoutMs ?? 30_000;
+      let session: BrowserSession;
+      if (params.sessionId) {
+        session = getBrowserSession(params.sessionId);
+      } else {
+        const browserName = normalizeBrowser(params.browser);
+        session = await createBrowserSession(browserName, params, (msg) => {
+          onUpdate?.({ content: [{ type: "text", text: msg }], details: undefined });
+        });
+      }
+      signal?.addEventListener("abort", () => { closeBrowserSession(session.id).catch(() => {}); });
+      onUpdate?.({ content: [{ type: "text", text: `Navigating session ${session.id} to ${url}...` }], details: undefined });
+      const response = await session.page.goto(url, { waitUntil, timeout });
+      touchSession(session);
+      const snapshot = await summarizeCurrentPage(session);
+      const statusCode = response?.status() ?? null;
+      return makeTextResult(`Session: ${session.id}\nBrowser: ${session.browserName}\nURL: ${session.page.url()}\nTitle: ${await session.page.title()}\nHTTP: ${statusCode ?? "unknown"}\nWaited for: ${waitUntil}\n\n---\n\n${snapshot}`, {
+        sessionId: session.id,
+        browser: session.browserName,
+        url,
+        finalUrl: session.page.url(),
+        title: await session.page.title(),
+        statusCode,
+        waitUntil,
+      });
+    },
+  } as any;
+
+  const browserSnapshotTool = {
+    name: "browser_snapshot",
+    label: "Browser Snapshot",
+    description: "Inspect the current state of a persistent browser session as visible text and interactive elements.",
+    promptSnippet: "Inspect the current page in a browser session before choosing what to click or type.",
+    promptGuidelines: [
+      "Use browser_snapshot after browser_open and after important interactions to understand current UI state.",
+      "Prefer the default visible-elements mode for app testing; use html only when debugging DOM details.",
+    ],
+    parameters: Type.Object({
+      sessionId: Type.String({ description: "Browser session ID returned by browser_open." }),
+      mode: Type.Optional(Type.String({ description: 'Snapshot mode: "visible-elements" (default), "text", "html", or "accessibility".' })),
+      maxCharacters: Type.Optional(Type.Integer({ description: `Maximum characters to return (default ${DEFAULT_SNAPSHOT_CHARACTERS}, hard cap ${MAX_ALLOWED_CHARACTERS}).`, minimum: 1, maximum: MAX_ALLOWED_CHARACTERS })),
+    }),
+    async execute(_toolCallId, params) {
+      const session = getBrowserSession(params.sessionId);
+      const mode = normalizeSnapshotMode(params.mode);
+      const maxCharacters = Math.min(params.maxCharacters ?? DEFAULT_SNAPSHOT_CHARACTERS, MAX_ALLOWED_CHARACTERS);
+      const snapshot = await buildSessionSnapshot(session.page, mode, maxCharacters);
+      touchSession(session);
+      return makeTextResult(snapshot, { sessionId: session.id, url: session.page.url(), title: await session.page.title(), mode });
+    },
+  } as any;
+
+  const browserInteractTool = {
+    name: "browser_interact",
+    label: "Browser Interact",
+    description: "Click, fill, type, press keys, select, check, uncheck, or hover in a persistent browser session.",
+    promptSnippet: "Interact with a page using accessible locators such as role/name, label, placeholder, or testId.",
+    promptGuidelines: [
+      "Prefer role + name, label, placeholder, or testId locators before CSS selectors.",
+      "Call browser_snapshot first if you are unsure which controls are visible.",
+      "After interactions that should change UI state, inspect the returned summary or call browser_snapshot/browser_logs.",
+    ],
+    parameters: Type.Object({
+      sessionId: Type.String({ description: "Browser session ID returned by browser_open." }),
+      action: Type.String({ description: 'Action: "click", "fill", "type", "press", "select", "check", "uncheck", or "hover".' }),
+      role: Type.Optional(Type.String({ description: "ARIA role for accessible locator, e.g. button, link, textbox." })),
+      name: Type.Optional(Type.String({ description: "Accessible name to combine with role." })),
+      label: Type.Optional(Type.String({ description: "Form label text." })),
+      placeholder: Type.Optional(Type.String({ description: "Input placeholder text." })),
+      testId: Type.Optional(Type.String({ description: "data-testid value." })),
+      text: Type.Optional(Type.String({ description: "Visible text locator." })),
+      css: Type.Optional(Type.String({ description: "CSS selector fallback." })),
+      value: Type.Optional(Type.String({ description: "Value for fill/type/select." })),
+      key: Type.Optional(Type.String({ description: "Key for press, e.g. Enter, Escape, Control+A." })),
+      exact: Type.Optional(Type.Boolean({ description: "Whether text/name matching should be exact." })),
+      nth: Type.Optional(Type.Integer({ description: "Zero-based index when locator intentionally matches multiple elements.", minimum: 0 })),
+      timeoutMs: Type.Optional(Type.Integer({ description: "Action timeout in milliseconds. Default 10000.", minimum: 1 })),
+    }),
+    async execute(_toolCallId, params) {
+      const session = getBrowserSession(params.sessionId);
+      const action = String(params.action || "").trim().toLowerCase();
+      const timeout = params.timeoutMs ?? 10_000;
+      const targetRequired = action !== "press" || params.role || params.label || params.placeholder || params.testId || params.text || params.css;
+      let locatorDescription = "page";
+      if (targetRequired) {
+        const resolved = await assertSingleLocator(session.page, params);
+        locatorDescription = `${resolved.description}${resolved.count > 1 ? ` nth=${params.nth}` : ""}`;
+        if (action === "click") await resolved.locator.click({ timeout });
+        else if (action === "fill") await resolved.locator.fill(params.value ?? "", { timeout });
+        else if (action === "type") await resolved.locator.type(params.value ?? "", { timeout });
+        else if (action === "press") {
+          if (!params.key) throw new Error("key is required for press");
+          await resolved.locator.press(params.key, { timeout });
+        } else if (action === "select") {
+          if (params.value === undefined) throw new Error("value is required for select");
+          await resolved.locator.selectOption(params.value, { timeout });
+        } else if (action === "check") await resolved.locator.check({ timeout });
+        else if (action === "uncheck") await resolved.locator.uncheck({ timeout });
+        else if (action === "hover") await resolved.locator.hover({ timeout });
+        else throw new Error('Invalid action. Expected "click", "fill", "type", "press", "select", "check", "uncheck", or "hover".');
+      } else {
+        if (action !== "press") throw new Error("A locator is required for this action.");
+        if (!params.key) throw new Error("key is required for press");
+        await session.page.keyboard.press(params.key);
+      }
+      touchSession(session);
+      const snapshot = await summarizeCurrentPage(session);
+      const recentProblems = [
+        ...session.pageErrors.slice(-3).map((e) => `Page error: ${e.text}`),
+        ...session.consoleEntries.filter((e) => e.type === "error").slice(-3).map((e) => `Console error: ${e.text}`),
+        ...session.networkEntries.slice(-3).map((e) => `Network ${e.status ?? "failed"}: ${e.method} ${e.url}`),
+      ];
+      return makeTextResult(`Action: ${action}\nLocator: ${locatorDescription}\nSession: ${session.id}\nURL: ${session.page.url()}\nTitle: ${await session.page.title()}${recentProblems.length ? `\n\nRecent problems:\n${recentProblems.map((p) => `- ${p}`).join("\n")}` : ""}\n\n---\n\n${snapshot}`, {
+        sessionId: session.id,
+        action,
+        locator: locatorDescription,
+        url: session.page.url(),
+        title: await session.page.title(),
+      });
+    },
+  } as any;
+
+  const browserLogsTool = {
+    name: "browser_logs",
+    label: "Browser Logs",
+    description: "Read console messages, page errors, failed requests, and HTTP error responses captured for a browser session.",
+    promptSnippet: "Inspect browser console, page errors, and network failures for a browser session.",
+    promptGuidelines: ["Use browser_logs when debugging blank screens, failed interactions, or local app errors."],
+    parameters: Type.Object({
+      sessionId: Type.String({ description: "Browser session ID returned by browser_open." }),
+      sinceLastCall: Type.Optional(Type.Boolean({ description: "When true, return only entries not returned by the previous browser_logs call." })),
+      includeConsole: Type.Optional(Type.Boolean({ description: "Include console messages. Defaults true." })),
+      includePageErrors: Type.Optional(Type.Boolean({ description: "Include uncaught page errors. Defaults true." })),
+      includeNetwork: Type.Optional(Type.Boolean({ description: "Include failed requests and HTTP 4xx/5xx responses. Defaults true." })),
+      maxEntries: Type.Optional(Type.Integer({ description: `Maximum entries per category. Default ${DEFAULT_LOG_ENTRIES}.`, minimum: 1 })),
+    }),
+    async execute(_toolCallId, params) {
+      const session = getBrowserSession(params.sessionId);
+      const maxEntries = params.maxEntries ?? DEFAULT_LOG_ENTRIES;
+      const since = params.sinceLastCall ?? false;
+      const consoleEntries = (params.includeConsole ?? true) ? session.consoleEntries.slice(since ? session.lastConsoleCursor : 0).slice(-maxEntries) : [];
+      const pageErrors = (params.includePageErrors ?? true) ? session.pageErrors.slice(since ? session.lastPageErrorCursor : 0).slice(-maxEntries) : [];
+      const networkEntries = (params.includeNetwork ?? true) ? session.networkEntries.slice(since ? session.lastNetworkCursor : 0).slice(-maxEntries) : [];
+      if (since) {
+        session.lastConsoleCursor = session.consoleEntries.length;
+        session.lastPageErrorCursor = session.pageErrors.length;
+        session.lastNetworkCursor = session.networkEntries.length;
+      }
+      touchSession(session);
+      const parts: string[] = [`Session: ${session.id}`, `URL: ${session.page.url()}`, `Title: ${await session.page.title()}`];
+      parts.push("\n## Console");
+      parts.push(consoleEntries.length ? consoleEntries.map((e) => `- [${e.type}] ${e.text}`).join("\n") : "_No console entries._");
+      parts.push("\n## Page errors");
+      parts.push(pageErrors.length ? pageErrors.map((e) => `- ${e.text}`).join("\n") : "_No page errors._");
+      parts.push("\n## Network errors");
+      parts.push(networkEntries.length ? networkEntries.map((e) => `- ${e.status ?? "failed"} ${e.method} ${e.url}${e.failure ? ` — ${e.failure}` : ""}`).join("\n") : "_No failed requests or HTTP error responses._");
+      return makeTextResult(truncateText(parts.join("\n"), MAX_ALLOWED_CHARACTERS).text, {
+        sessionId: session.id,
+        consoleCount: consoleEntries.length,
+        pageErrorCount: pageErrors.length,
+        networkCount: networkEntries.length,
+      });
+    },
+  } as any;
+
+  const browserScreenshotTool = {
+    name: "browser_screenshot",
+    label: "Browser Screenshot",
+    description: "Save a screenshot of a persistent browser session to disk and return the file path.",
+    promptSnippet: "Capture a screenshot when visual layout or rendered appearance matters.",
+    parameters: Type.Object({
+      sessionId: Type.String({ description: "Browser session ID returned by browser_open." }),
+      fullPage: Type.Optional(Type.Boolean({ description: "Capture the full scrollable page. Defaults false." })),
+      path: Type.Optional(Type.String({ description: "Optional output path. Defaults to the session artifact directory under /tmp/pi-playwright-web." })),
+    }),
+    async execute(_toolCallId, params) {
+      const session = getBrowserSession(params.sessionId);
+      const screenshotPath = params.path || join(session.artifactDir, `screenshot-${String(++session.screenshotCount).padStart(3, "0")}.png`);
+      mkdirSync(dirname(screenshotPath), { recursive: true });
+      await session.page.screenshot({ path: screenshotPath, fullPage: params.fullPage ?? false });
+      touchSession(session);
+      return makeTextResult(`Screenshot saved: ${screenshotPath}\nSession: ${session.id}\nURL: ${session.page.url()}\nTitle: ${await session.page.title()}`, {
+        sessionId: session.id,
+        path: screenshotPath,
+        url: session.page.url(),
+        title: await session.page.title(),
+      });
+    },
+  } as any;
+
+  const browserWaitTool = {
+    name: "browser_wait",
+    label: "Browser Wait",
+    description: "Wait for page load states, selectors, text, URL changes, or a fixed timeout in a persistent browser session.",
+    promptSnippet: "Wait for async UI changes, route changes, selectors, or text before taking the next browser action.",
+    promptGuidelines: [
+      "Use browser_wait after actions that trigger asynchronous UI updates or navigation.",
+      "Prefer waiting for specific text or selectors over fixed timeouts.",
+    ],
+    parameters: Type.Object({
+      sessionId: Type.String({ description: "Browser session ID returned by browser_open." }),
+      for: Type.String({ description: 'Condition to wait for: "load", "domcontentloaded", "networkidle", "selector", "text", "url", or "timeout".' }),
+      selector: Type.Optional(Type.String({ description: "CSS selector to wait for when for=selector." })),
+      text: Type.Optional(Type.String({ description: "Visible text to wait for when for=text." })),
+      urlPattern: Type.Optional(Type.String({ description: "URL glob string or regular expression source to wait for when for=url." })),
+      exact: Type.Optional(Type.Boolean({ description: "Whether text matching should be exact. Used when for=text." })),
+      timeoutMs: Type.Optional(Type.Integer({ description: "Wait timeout in milliseconds. Default 10000.", minimum: 1 })),
+    }),
+    async execute(_toolCallId, params) {
+      const session = getBrowserSession(params.sessionId);
+      const condition = String(params.for || "").trim().toLowerCase();
+      const timeout = params.timeoutMs ?? 10_000;
+      if (condition === "load" || condition === "domcontentloaded" || condition === "networkidle") {
+        await session.page.waitForLoadState(condition as WaitUntil, { timeout });
+      } else if (condition === "selector") {
+        if (!params.selector) throw new Error("selector is required when for=selector");
+        await session.page.waitForSelector(params.selector, { state: "visible", timeout });
+      } else if (condition === "text") {
+        if (!params.text) throw new Error("text is required when for=text");
+        await session.page.getByText(params.text, { exact: params.exact ?? false }).first().waitFor({ state: "visible", timeout });
+      } else if (condition === "url") {
+        if (!params.urlPattern) throw new Error("urlPattern is required when for=url");
+        let pattern: string | RegExp = params.urlPattern;
+        if (params.urlPattern.startsWith("/") && params.urlPattern.lastIndexOf("/") > 0) {
+          const lastSlash = params.urlPattern.lastIndexOf("/");
+          pattern = new RegExp(params.urlPattern.slice(1, lastSlash), params.urlPattern.slice(lastSlash + 1));
+        }
+        await session.page.waitForURL(pattern as any, { timeout });
+      } else if (condition === "timeout") {
+        await session.page.waitForTimeout(timeout);
+      } else {
+        throw new Error('Invalid wait condition. Expected "load", "domcontentloaded", "networkidle", "selector", "text", "url", or "timeout".');
+      }
+      touchSession(session);
+      const snapshot = await summarizeCurrentPage(session);
+      return makeTextResult(`Waited for: ${condition}\nSession: ${session.id}\nURL: ${session.page.url()}\nTitle: ${await session.page.title()}\n\n---\n\n${snapshot}`, {
+        sessionId: session.id,
+        condition,
+        url: session.page.url(),
+        title: await session.page.title(),
+      });
+    },
+  } as any;
+
+  const browserEvalTool = {
+    name: "browser_eval",
+    label: "Browser Eval",
+    description: "Execute JavaScript in the current page of a persistent browser session and return a bounded serialized result.",
+    promptSnippet: "Run JavaScript in the page for advanced debugging when snapshots and normal interactions are insufficient.",
+    promptGuidelines: [
+      "Prefer browser_snapshot and browser_interact first; use browser_eval for advanced inspection only.",
+      "Keep expressions small and side-effect-free unless intentionally debugging page behavior.",
+    ],
+    parameters: Type.Object({
+      sessionId: Type.String({ description: "Browser session ID returned by browser_open." }),
+      expression: Type.String({ description: "JavaScript expression to evaluate in the page context." }),
+      timeoutMs: Type.Optional(Type.Integer({ description: "Evaluation timeout in milliseconds. Default 5000.", minimum: 1 })),
+      maxCharacters: Type.Optional(Type.Integer({ description: `Maximum characters to return (default ${DEFAULT_SNAPSHOT_CHARACTERS}, hard cap ${MAX_ALLOWED_CHARACTERS}).`, minimum: 1, maximum: MAX_ALLOWED_CHARACTERS })),
+    }),
+    async execute(_toolCallId, params) {
+      const session = getBrowserSession(params.sessionId);
+      const timeout = params.timeoutMs ?? 5_000;
+      const maxCharacters = Math.min(params.maxCharacters ?? DEFAULT_SNAPSHOT_CHARACTERS, MAX_ALLOWED_CHARACTERS);
+      const value = await withTimeout(
+        session.page.evaluate((expression) => (0, eval)(expression), params.expression),
+        timeout,
+        "browser_eval",
+      );
+      touchSession(session);
+      const result = formatEvalValue(value, maxCharacters);
+      return makeTextResult(`Session: ${session.id}\nURL: ${session.page.url()}\nTitle: ${await session.page.title()}\nExpression:\n\n\`\`\`js\n${params.expression}\n\`\`\`\n\nResult:\n\n\`\`\`json\n${result}\n\`\`\``, {
+        sessionId: session.id,
+        url: session.page.url(),
+        title: await session.page.title(),
+        returnedLength: result.length,
+      });
+    },
+  } as any;
+
+  const browserAssertTool = {
+    name: "browser_assert",
+    label: "Browser Assert",
+    description: "Run a lightweight UI assertion against a persistent browser session.",
+    promptSnippet: "Assert visible text, selector visibility, URL, or title when validating web app behavior.",
+    parameters: Type.Object({
+      sessionId: Type.String({ description: "Browser session ID returned by browser_open." }),
+      assertion: Type.String({ description: 'Assertion: "text-visible", "text-not-visible", "selector-visible", "selector-not-visible", "url-matches", or "title-matches".' }),
+      text: Type.Optional(Type.String({ description: "Text for text-visible/text-not-visible." })),
+      selector: Type.Optional(Type.String({ description: "CSS selector for selector-visible/selector-not-visible." })),
+      pattern: Type.Optional(Type.String({ description: "Regular expression source for url-matches/title-matches." })),
+      exact: Type.Optional(Type.Boolean({ description: "Whether text matching should be exact." })),
+      timeoutMs: Type.Optional(Type.Integer({ description: "Assertion timeout in milliseconds. Default 5000.", minimum: 1 })),
+    }),
+    async execute(_toolCallId, params) {
+      const session = getBrowserSession(params.sessionId);
+      const assertion = String(params.assertion || "").trim().toLowerCase();
+      const timeout = params.timeoutMs ?? 5_000;
+      if (assertion === "text-visible") {
+        if (!params.text) throw new Error("text is required for text-visible");
+        await session.page.getByText(params.text, { exact: params.exact ?? false }).first().waitFor({ state: "visible", timeout });
+      } else if (assertion === "text-not-visible") {
+        if (!params.text) throw new Error("text is required for text-not-visible");
+        await session.page.getByText(params.text, { exact: params.exact ?? false }).first().waitFor({ state: "hidden", timeout });
+      } else if (assertion === "selector-visible") {
+        if (!params.selector) throw new Error("selector is required for selector-visible");
+        await session.page.locator(params.selector).first().waitFor({ state: "visible", timeout });
+      } else if (assertion === "selector-not-visible") {
+        if (!params.selector) throw new Error("selector is required for selector-not-visible");
+        await session.page.locator(params.selector).first().waitFor({ state: "hidden", timeout });
+      } else if (assertion === "url-matches") {
+        if (!params.pattern) throw new Error("pattern is required for url-matches");
+        const regex = new RegExp(params.pattern);
+        await withTimeout(session.page.waitForFunction((source) => new RegExp(source).test((globalThis as any).location.href), params.pattern), timeout, "url-matches");
+        if (!regex.test(session.page.url())) throw new Error(`URL did not match /${params.pattern}/: ${session.page.url()}`);
+      } else if (assertion === "title-matches") {
+        if (!params.pattern) throw new Error("pattern is required for title-matches");
+        await withTimeout(session.page.waitForFunction((source) => new RegExp(source).test((globalThis as any).document.title), params.pattern), timeout, "title-matches");
+      } else {
+        throw new Error('Invalid assertion. Expected "text-visible", "text-not-visible", "selector-visible", "selector-not-visible", "url-matches", or "title-matches".');
+      }
+      touchSession(session);
+      return makeTextResult(`Assertion passed: ${assertion}\nSession: ${session.id}\nURL: ${session.page.url()}\nTitle: ${await session.page.title()}`, {
+        sessionId: session.id,
+        assertion,
+        passed: true,
+        url: session.page.url(),
+        title: await session.page.title(),
+      });
+    },
+  } as any;
+
+  const browserCloseTool = {
+    name: "browser_close",
+    label: "Browser Close",
+    description: "Close a persistent browser session and release its browser context.",
+    promptSnippet: "Close a browser session when finished with local web development testing.",
+    parameters: Type.Object({ sessionId: Type.String({ description: "Browser session ID returned by browser_open." }) }),
+    async execute(_toolCallId, params) {
+      const closed = await closeBrowserSession(params.sessionId);
+      return makeTextResult(closed ? `Closed browser session: ${params.sessionId}` : `No such browser session: ${params.sessionId}`, { sessionId: params.sessionId, closed });
+    },
+  } as any;
+
+  const browserListSessionsTool = {
+    name: "browser_list_sessions",
+    label: "Browser List Sessions",
+    description: "List active persistent browser sessions.",
+    promptSnippet: "List active browser sessions and their current URLs.",
+    parameters: Type.Object({}),
+    async execute() {
+      const entries = Array.from(sessions.values());
+      const lines = entries.length ? await Promise.all(entries.map(async (s) => `- ${s.id} ${s.browserName} ${s.page.url()} — ${await s.page.title()}`)) : ["_No active browser sessions._"];
+      return makeTextResult(["# Active browser sessions", ...lines].join("\n"), { count: entries.length, sessions: entries.map((s) => ({ id: s.id, browser: s.browserName, url: s.page.url(), createdAt: s.createdAt, lastUsedAt: s.lastUsedAt })) });
+    },
+  } as any;
+
   pi.registerTool(tool);
+  pi.registerTool(browserOpenTool);
+  pi.registerTool(browserSnapshotTool);
+  pi.registerTool(browserInteractTool);
+  pi.registerTool(browserLogsTool);
+  pi.registerTool(browserScreenshotTool);
+  pi.registerTool(browserWaitTool);
+  pi.registerTool(browserEvalTool);
+  pi.registerTool(browserAssertTool);
+  pi.registerTool(browserCloseTool);
+  pi.registerTool(browserListSessionsTool);
 }
