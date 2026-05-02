@@ -80,7 +80,7 @@ Recommended workflow:
 
 | Tool | Purpose |
 |---|---|
-| `browser_open` | Open a URL in a persistent browser session and return a `sessionId`. Defaults local-development navigation to `domcontentloaded`. |
+| `browser_open` | Open a URL in a persistent browser session and return a `sessionId`. Defaults local-development navigation to `domcontentloaded`. Supports `viewport`, `deviceScaleFactor`, `mobile`, and `hasTouch` for mobile-style testing. |
 | `browser_snapshot` | Return current URL/title, visible interactive elements, and visible text. Optional modes: `visible-elements`, `text`, `html`, `accessibility` alias. |
 | `browser_interact` | Perform `click`, `fill`, `type`, `press`, `select`, `check`, `uncheck`, or `hover`. Prefer accessible locators: role/name, label, placeholder, testId. |
 | `browser_logs` | Read captured console messages, page errors, failed requests, and HTTP 4xx/5xx responses. |
@@ -103,6 +103,22 @@ The interactive tools are optimized for dev servers:
 | `example.com` | `https://example.com` |
 
 `read_website_browser` keeps its existing HTTP(S) reader behavior and should still be used for content extraction from remote websites and documentation. Use the `browser_*` tools for interactive local app testing.
+
+### Mobile-style sessions
+
+For mobile-style testing with the interactive browser tools, pass a phone-sized viewport and optionally enable Playwright's mobile and touch flags:
+
+```json
+{
+  "url": "http://127.0.0.1:5173",
+  "viewport": { "width": 390, "height": 844 },
+  "deviceScaleFactor": 3,
+  "mobile": true,
+  "hasTouch": true
+}
+```
+
+This is lighter-weight than full named-device presets, but useful for responsive and touch-oriented UI checks.
 
 ### Lifecycle and cleanup
 

@@ -787,7 +787,12 @@ function registerSessionListeners(session: BrowserSession): void {
 
 async function createBrowserSession(
   browserName: BrowserName,
-  options: { viewport?: { width: number; height: number }; deviceScaleFactor?: number },
+  options: {
+    viewport?: { width: number; height: number };
+    deviceScaleFactor?: number;
+    mobile?: boolean;
+    hasTouch?: boolean;
+  },
   onUpdate: (msg: string) => void,
 ): Promise<BrowserSession> {
   const browser = await acquireBrowser(browserName, onUpdate);
@@ -798,6 +803,8 @@ async function createBrowserSession(
     const context = await browser.newContext({
       ...(options.viewport ? { viewport: options.viewport } : {}),
       ...(options.deviceScaleFactor ? { deviceScaleFactor: options.deviceScaleFactor } : {}),
+      ...(options.mobile !== undefined ? { isMobile: options.mobile } : {}),
+      ...(options.hasTouch !== undefined ? { hasTouch: options.hasTouch } : {}),
       userAgent:
         browserName === "chromium"
           ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -1230,6 +1237,8 @@ export default function playwrightWebExtension(pi: ExtensionAPI) {
       timeoutMs: Type.Optional(Type.Integer({ description: "Navigation timeout in milliseconds. Default 30000.", minimum: 1 })),
       viewport: Type.Optional(Type.Object({ width: Type.Integer({ minimum: 1 }), height: Type.Integer({ minimum: 1 }) })),
       deviceScaleFactor: Type.Optional(Type.Integer({ description: "Device scale factor for new sessions.", minimum: 1 })),
+      mobile: Type.Optional(Type.Boolean({ description: "When true, enable Playwright mobile emulation for new sessions." })),
+      hasTouch: Type.Optional(Type.Boolean({ description: "When true, enable touch input support for new sessions." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate) {
       const url = normalizeInteractiveUrl(params.url);
